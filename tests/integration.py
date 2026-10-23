@@ -71,31 +71,32 @@ class DeltaTests(unittest.TestCase):
                 'SELECT count(*) FROM pg_stat_database; ')
             row = self.current(rows)
             self.assertEqual(row['status'], 'ok')
-            self.assertGreaterEqual(row['xact_commit'], 20)
-            self.assertGreaterEqual(row['xact_rollback'], 1)
+            self.assertGreaterEqual(row['xact_commit_delta'], 20)
+            self.assertGreaterEqual(row['xact_rollback_delta'], 1)
             self.assertGreaterEqual(row['elapsed_seconds'], 1.5)
 
     def test_reset(self):
         row = self.current(self.sample(lambda: sql('SELECT pg_stat_reset()')))
         self.assertEqual(row['status'], 'reset')
-        self.assertIsNone(row['xact_commit'])
-        self.assertIsNone(row['blks_read'])
+        self.assertIsNone(row['xact_commit_delta'])
+        self.assertIsNone(row['blks_read_delta'])
 
-    def test_database_lifecycle(self):
+    def test_catalog_snapshot(self):
         name = 'delta_test_lifecycle'
         try:
             rows = self.sample(lambda: sql(f'CREATE DATABASE {name}'))
-            row = next(r for r in rows if r['datname'] == name)
-            self.assertEqual(row['status'], 'new')
-            self.assertIsNone(row['xact_commit'])
+            # One SQL statement retains its original catalog snapshot.
+            self.assertFalse(any(r['datname'] == name for r in rows))
+            oid = sql(f"SELECT oid FROM pg_database WHERE datname='{name}'")
             rows = self.sample(lambda: sql(f'ALTER DATABASE {name} RENAME TO {name}_renamed'))
-            row = next(r for r in rows if r['datid'] == row['datid'])
-            self.assertEqual(row['datname'], name + '_renamed')
+            row = next(r for r in rows if r['datid'] == oid)
+            self.assertEqual(row['datname'], name)
             self.assertEqual(row['status'], 'ok')
             rows = self.sample(lambda: sql(f'DROP DATABASE {name}_renamed'))
-            row = next(r for r in rows if r['datname'] == name + '_renamed')
-            self.assertEqual(row['status'], 'dropped')
-            self.assertIsNone(row['xact_commit'])
+            row = next(r for r in rows if r['datid'] == oid)
+            self.assertEqual(row['datname'], name + '_renamed')
+            # Its catalog row remains visible, but its statistics may disappear.
+            self.assertIn(row['status'], ['ok', 'reset'])
         finally:
             sql(f'DROP DATABASE IF EXISTS {name}')
             sql(f'DROP DATABASE IF EXISTS {name}_renamed')
