@@ -1,0 +1,3 @@
+comment = 'On-demand deltas of PostgreSQL statistics'
+default_version = '0.1.0'
+relocatable = true
