@@ -29,3 +29,20 @@ For every statistics function or query change:
   or benchmark only an outer Function Scan that hides the underlying SQL.
 - When reporting an optimization, state what was measured, the PostgreSQL version,
   workload and limitations. Do not claim measured improvements without evidence.
+
+## Query clarity
+
+Keep monitoring queries as clear and direct as possible without sacrificing
+correctness or the monitoring-overhead priority above. Remove redundant
+expressions and execution dependencies rather than keeping unexplained tricks.
+When a necessary technique has non-obvious behavior (for example, a materialized
+CTE dependency, an OFFSET barrier, or cache invalidation ordering), explain its
+purpose and required execution semantics in a comment at that exact location.
+Comments must explain why the technique is needed, not just restate the SQL.
+
+## Extension version during development
+
+Keep every function in the single extension version 0.1.0 until the user requests
+otherwise. Do not introduce a version or upgrade script for each new function.
+Edit the named per-function SQL sources and build the complete 0.1.0 installation
+script with make. Keep that tracked script synchronized for direct review.

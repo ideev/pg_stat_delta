@@ -19,11 +19,11 @@ class DeltaTests(unittest.TestCase):
     def setUpClass(cls):
         sql('CREATE EXTENSION IF NOT EXISTS pg_stat_delta')
 
-    def sample(self, action, prefix=''):
+    def sample(self, action, prefix='', function='pg_stat_database_delta', condition='TRUE'):
         proc = subprocess.Popen(
             [PSQL, '-XAt', '-v', 'ON_ERROR_STOP=1', '-c', prefix +
              'SELECT coalesce(jsonb_agg(to_jsonb(d)),\'[]\'::jsonb) '
-             'FROM pg_stat_database_delta(1.5) d'],
+             f'FROM {function}(1.5) d WHERE {condition}'],
             env={**os.environ, 'PGAPPNAME': 'delta_test_sampler'},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
@@ -109,7 +109,11 @@ class DeltaTests(unittest.TestCase):
         try:
             result = sql('SET ROLE delta_test_reader; '
                          "SET search_path = ''; "
-                         'SELECT count(*)>0 FROM delta_test_schema.pg_stat_database_delta(0);')
+                         'SELECT count(*)>0 FROM delta_test_schema.pg_stat_database_delta(0); '
+                         'SELECT count(*)>=0 FROM delta_test_schema.pg_stat_user_tables_delta(0); '
+                         'SELECT count(*)>=0 FROM delta_test_schema.pg_stat_user_indexes_delta(0); '
+                         'SELECT count(*)>=0 FROM delta_test_schema.pg_statio_user_tables_delta(0); '
+                         'SELECT count(*)>=0 FROM delta_test_schema.pg_statio_user_indexes_delta(0);')
             self.assertEqual(result.splitlines()[-1], 't')
         finally:
             sql('ALTER EXTENSION pg_stat_delta SET SCHEMA public; '
@@ -121,6 +125,544 @@ class DeltaTests(unittest.TestCase):
                      'SELECT count(*)>0 FROM pg_stat_database_delta(0); '
                      'SELECT count(*)>0 FROM pg_stat_database_delta(0); COMMIT;')
         self.assertEqual(result.splitlines().count('t'), 2)
+
+
+class TableDeltaTests(unittest.TestCase):
+    sample = DeltaTests.sample
+
+    @classmethod
+    def setUpClass(cls):
+        sql('CREATE SCHEMA delta_table_tests; '
+            'CREATE TABLE delta_table_tests.heap(id integer, payload integer) '
+            'WITH (autovacuum_enabled=false); '
+            'CREATE TABLE delta_table_tests.indexed(id integer PRIMARY KEY) '
+            'WITH (autovacuum_enabled=false); '
+            'INSERT INTO delta_table_tests.indexed SELECT generate_series(1,1000); '
+            'SELECT pg_stat_force_next_flush();')
+
+    @classmethod
+    def tearDownClass(cls):
+        sql('DROP SCHEMA delta_table_tests CASCADE')
+
+    def table_sample(self, action, table='heap', prefix=''):
+        rows = self.sample(action, prefix, 'pg_stat_user_tables_delta',
+                           f"schemaname='delta_table_tests' AND relname='{table}'")
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(rows[0]['elapsed_seconds'], 1.5)
+        return rows[0]
+
+    def test_dml_and_cache_modes(self):
+        for number, mode in enumerate(['none', 'cache', 'snapshot']):
+            base = 10000 + number * 100
+            row = self.table_sample(
+                lambda: sql(f'INSERT INTO delta_table_tests.heap '
+                            f'SELECT i,0 FROM generate_series({base},{base+99}) i; '
+                            f'UPDATE delta_table_tests.heap SET payload=1 '
+                            f'WHERE id BETWEEN {base} AND {base+9}; '
+                            f'DELETE FROM delta_table_tests.heap '
+                            f'WHERE id BETWEEN {base+95} AND {base+99}; '
+                            'SELECT pg_stat_force_next_flush();'),
+                prefix=f"BEGIN; SET LOCAL stats_fetch_consistency='{mode}'; "
+                       'SELECT count(*) FROM pg_stat_user_tables; ')
+            self.assertEqual(row['status'], 'ok')
+            self.assertEqual(row['n_tup_ins_delta'], 100)
+            self.assertEqual(row['n_tup_upd_delta'], 10)
+            self.assertEqual(row['n_tup_del_delta'], 5)
+            self.assertGreater(row['seq_scan_delta'], 0)
+            self.assertIsNone(row['idx_scan_delta'])
+            self.assertIsNone(row['idx_tup_fetch_delta'])
+
+    def test_index_scan(self):
+        row = self.table_sample(
+            lambda: sql('SET enable_seqscan=off; '
+                        'SELECT sum(id) FROM delta_table_tests.indexed WHERE id BETWEEN 1 AND 50; '
+                        'SELECT pg_stat_force_next_flush();'), table='indexed')
+        self.assertEqual(row['status'], 'ok')
+        self.assertGreater(row['idx_scan_delta'], 0)
+
+    def test_maintenance_gauges(self):
+        sql('INSERT INTO delta_table_tests.heap VALUES (90000,0); '
+            'SELECT pg_stat_force_next_flush();')
+        row = self.table_sample(lambda: sql('ANALYZE delta_table_tests.heap'))
+        self.assertEqual(row['status'], 'ok')
+        self.assertEqual(row['analyze_count_delta'], 1)
+        self.assertLess(row['n_mod_since_analyze_delta'], 0)
+        self.assertEqual(row['n_mod_since_analyze_end'], 0)
+        self.assertIsNotNone(row['last_analyze_end'])
+
+    def test_table_reset(self):
+        sql('INSERT INTO delta_table_tests.heap VALUES (90001,0); '
+            'SELECT pg_stat_force_next_flush();')
+        row = self.table_sample(lambda: sql(
+            "SELECT pg_stat_reset_single_table_counters('delta_table_tests.heap'::regclass)"))
+        self.assertEqual(row['status'], 'reset')
+        self.assertIsNone(row['n_tup_ins_delta'])
+        self.assertIsNone(row['seq_scan_delta'])
+
+    def test_reset_with_counters_catching_up(self):
+        sql('CREATE TABLE delta_table_tests.reset_catchup(id integer) '
+            'WITH (autovacuum_enabled=false); '
+            'INSERT INTO delta_table_tests.reset_catchup SELECT generate_series(1,10); '
+            'SELECT pg_stat_force_next_flush();')
+        row = self.table_sample(lambda: sql(
+            "SELECT pg_stat_reset_single_table_counters('delta_table_tests.reset_catchup'::regclass); "
+            'INSERT INTO delta_table_tests.reset_catchup SELECT generate_series(11,30); '
+            'SELECT pg_stat_force_next_flush();'), table='reset_catchup')
+        self.assertEqual(row['status'], 'reset')
+        self.assertNotEqual(row['database_stats_reset_start'], row['database_stats_reset_end'])
+        self.assertIsNone(row['n_tup_ins_delta'])
+        self.assertGreater(row['n_live_tup_end'], row['n_live_tup_start'])
+
+    def test_dropped_table_statistics(self):
+        sql('CREATE TABLE delta_table_tests.dropped(id integer); '
+            'INSERT INTO delta_table_tests.dropped SELECT generate_series(1,10); '
+            'SELECT pg_stat_force_next_flush();')
+        row = self.table_sample(lambda: sql('DROP TABLE delta_table_tests.dropped'), table='dropped')
+        self.assertEqual(row['status'], 'counter_decreased')
+        self.assertIsNone(row['n_tup_ins_delta'])
+
+    def test_database_reset(self):
+        row = self.table_sample(lambda: sql('SELECT pg_stat_reset()'))
+        self.assertEqual(row['status'], 'reset')
+        self.assertIsNone(row['n_tup_ins_delta'])
+        self.assertIsNone(row['seq_scan_delta'])
+
+    def test_validation_and_repeated_calls(self):
+        for value in ['NULL', '-1', "'NaN'", "'Infinity'", "'-Infinity'"]:
+            result = subprocess.run([PSQL, '-X', '-v', 'ON_ERROR_STOP=1', '-c',
+                                     f'SELECT * FROM pg_stat_user_tables_delta({value})'],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('finite nonnegative', result.stderr)
+        result = sql('BEGIN; '
+                     "SET LOCAL stats_fetch_consistency='snapshot'; "
+                     'SELECT count(*)>0 FROM pg_stat_user_tables_delta(0); '
+                     'SELECT count(*)>0 FROM pg_stat_user_tables_delta(0); COMMIT;')
+        self.assertEqual(result.splitlines().count('t'), 2)
+
+    def test_catalog_snapshot(self):
+        sql('CREATE TABLE delta_table_tests.before_rename(id integer)')
+        try:
+            rows = self.sample(
+                lambda: sql('ALTER TABLE delta_table_tests.before_rename RENAME TO after_rename; '
+                            'CREATE TABLE delta_table_tests.created_during_sample(id integer)'),
+                function='pg_stat_user_tables_delta')
+            names = [r['relname'] for r in rows if r['schemaname'] == 'delta_table_tests']
+            self.assertIn('before_rename', names)
+            self.assertNotIn('after_rename', names)
+            self.assertNotIn('created_during_sample', names)
+        finally:
+            sql('DROP TABLE IF EXISTS delta_table_tests.before_rename, '
+                'delta_table_tests.after_rename, delta_table_tests.created_during_sample')
+
+
+class IndexDeltaTests(unittest.TestCase):
+    sample = DeltaTests.sample
+
+    @classmethod
+    def setUpClass(cls):
+        sql('CREATE SCHEMA delta_index_tests; '
+            'CREATE TABLE delta_index_tests.items(id integer PRIMARY KEY, payload integer) '
+            'WITH (autovacuum_enabled=false); '
+            'INSERT INTO delta_index_tests.items SELECT i,i FROM generate_series(1,10000) i; '
+            'SELECT pg_stat_force_next_flush();')
+
+    @classmethod
+    def tearDownClass(cls):
+        sql('DROP SCHEMA delta_index_tests CASCADE')
+
+    def index_sample(self, action, index='items_pkey', prefix=''):
+        rows = self.sample(action, prefix, 'pg_stat_user_indexes_delta',
+                           f"schemaname='delta_index_tests' AND indexrelname='{index}'")
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(rows[0]['elapsed_seconds'], 1.5)
+        return rows[0]
+
+    def test_plain_scan_and_cache_modes(self):
+        settings = 'SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=off; '
+        query = 'SELECT sum(payload) FROM delta_index_tests.items WHERE id BETWEEN 1 AND 50; '
+        self.assertIn('Index Scan', sql(settings + 'EXPLAIN ' + query))
+        for mode in ['none', 'cache', 'snapshot']:
+            row = self.index_sample(
+                lambda: sql(settings + query + 'SELECT pg_stat_force_next_flush();'),
+                prefix=f"BEGIN; SET LOCAL stats_fetch_consistency='{mode}'; "
+                       'SELECT count(*) FROM pg_stat_user_indexes; ')
+            self.assertEqual(row['status'], 'ok')
+            self.assertGreaterEqual(row['idx_scan_delta'], 1)
+            # Planning can also read boundary index tuples for selectivity estimates.
+            self.assertGreaterEqual(row['idx_tup_read_delta'], 50)
+            self.assertEqual(row['idx_tup_fetch_delta'], 50)
+            self.assertIsNotNone(row['last_idx_scan_end'])
+
+    def test_bitmap_scan(self):
+        settings = ('SET enable_seqscan=off; SET enable_indexscan=off; '
+                    'SET enable_indexonlyscan=off; SET enable_bitmapscan=on; ')
+        query = 'SELECT sum(payload) FROM delta_index_tests.items WHERE id BETWEEN 1 AND 50; '
+        self.assertIn('Bitmap Heap Scan', sql(settings + 'EXPLAIN ' + query))
+        row = self.index_sample(lambda: sql(settings + query + 'SELECT pg_stat_force_next_flush();'))
+        self.assertEqual(row['status'], 'ok')
+        self.assertGreaterEqual(row['idx_scan_delta'], 1)
+        # Physical reads can include the planner's boundary-value probes.
+        self.assertGreaterEqual(row['idx_tup_read_delta'], 50)
+        self.assertEqual(row['idx_tup_fetch_delta'], 0)
+
+    def test_index_only_scan(self):
+        sql('VACUUM ANALYZE delta_index_tests.items')
+        settings = 'SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on; '
+        query = 'SELECT sum(id) FROM delta_index_tests.items WHERE id BETWEEN 1 AND 50; '
+        self.assertIn('Index Only Scan', sql(settings + 'EXPLAIN ' + query))
+        row = self.index_sample(lambda: sql(settings + query + 'SELECT pg_stat_force_next_flush();'))
+        self.assertEqual(row['status'], 'ok')
+        self.assertGreaterEqual(row['idx_scan_delta'], 1)
+        # Physical reads can include the planner's boundary-value probes.
+        self.assertGreaterEqual(row['idx_tup_read_delta'], 50)
+        self.assertEqual(row['idx_tup_fetch_delta'], 0)
+
+    def test_separate_indexes_on_same_table(self):
+        sql('CREATE INDEX payload_idx ON delta_index_tests.items(payload)')
+        try:
+            rows = self.sample(lambda: sql(
+                'SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=off; '
+                'SELECT sum(payload) FROM delta_index_tests.items WHERE id BETWEEN 1 AND 50; '
+                'SELECT pg_stat_force_next_flush();'),
+                function='pg_stat_user_indexes_delta', condition="schemaname='delta_index_tests'")
+            by_name = {r['indexrelname']: r for r in rows}
+            active, idle = by_name['items_pkey'], by_name['payload_idx']
+            self.assertEqual(active['relid'], idle['relid'])
+            self.assertNotEqual(active['indexrelid'], idle['indexrelid'])
+            self.assertEqual(active['status'], 'ok')
+            self.assertEqual(idle['status'], 'ok')
+            self.assertGreaterEqual(active['idx_tup_read_delta'], 50)
+            self.assertEqual(idle['idx_scan_delta'], 0)
+            self.assertEqual(idle['idx_tup_read_delta'], 0)
+        finally:
+            sql('DROP INDEX delta_index_tests.payload_idx')
+
+    def test_index_reset(self):
+        row = self.index_sample(lambda: sql(
+            "SELECT pg_stat_reset_single_table_counters('delta_index_tests.items_pkey'::regclass)"))
+        self.assertEqual(row['status'], 'reset')
+        for counter in ['idx_scan_delta', 'idx_tup_read_delta', 'idx_tup_fetch_delta']:
+            self.assertIsNone(row[counter])
+
+    def test_database_reset(self):
+        row = self.index_sample(lambda: sql('SELECT pg_stat_reset()'))
+        self.assertEqual(row['status'], 'reset')
+        self.assertIsNone(row['idx_scan_delta'])
+
+    def test_catalog_snapshot(self):
+        try:
+            rows = self.sample(lambda: sql(
+                'ALTER INDEX delta_index_tests.items_pkey RENAME TO renamed_pkey; '
+                'CREATE INDEX created_during_sample ON delta_index_tests.items(payload)'),
+                function='pg_stat_user_indexes_delta')
+            names = [r['indexrelname'] for r in rows if r['schemaname']=='delta_index_tests']
+            self.assertIn('items_pkey', names)
+            self.assertNotIn('renamed_pkey', names)
+            self.assertNotIn('created_during_sample', names)
+        finally:
+            sql('DROP INDEX IF EXISTS delta_index_tests.created_during_sample; '
+                'ALTER INDEX delta_index_tests.renamed_pkey RENAME TO items_pkey;')
+
+    def test_dropped_index(self):
+        sql('CREATE TABLE delta_index_tests.dropped(id integer, payload integer) '
+            'WITH (autovacuum_enabled=false); '
+            'CREATE INDEX dropped_idx ON delta_index_tests.dropped(id); '
+            'INSERT INTO delta_index_tests.dropped SELECT i,i FROM generate_series(1,100) i; '
+            'SET enable_seqscan=off; SET enable_bitmapscan=off; '
+            'SELECT sum(payload) FROM delta_index_tests.dropped WHERE id<=50; '
+            'SELECT pg_stat_force_next_flush();')
+        row = self.index_sample(lambda: sql('DROP INDEX delta_index_tests.dropped_idx'),
+                                index='dropped_idx')
+        self.assertEqual(row['status'], 'counter_decreased')
+        self.assertIsNone(row['idx_scan_delta'])
+
+    def test_validation_and_repeated_calls(self):
+        for value in ['NULL', '-1', "'NaN'", "'Infinity'", "'-Infinity'"]:
+            result = subprocess.run([PSQL, '-X', '-v', 'ON_ERROR_STOP=1', '-c',
+                                     f'SELECT * FROM pg_stat_user_indexes_delta({value})'],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('finite nonnegative', result.stderr)
+        result = sql('BEGIN; '
+                     "SET LOCAL stats_fetch_consistency='snapshot'; "
+                     'SELECT count(*)>0 FROM pg_stat_user_indexes_delta(0); '
+                     'SELECT count(*)>0 FROM pg_stat_user_indexes_delta(0); COMMIT;')
+        self.assertEqual(result.splitlines().count('t'), 2)
+
+
+class StatioDeltaTests(unittest.TestCase):
+    sample = DeltaTests.sample
+    counters = ['heap_blks_read', 'heap_blks_hit', 'idx_blks_read', 'idx_blks_hit',
+                'toast_blks_read', 'toast_blks_hit', 'tidx_blks_read', 'tidx_blks_hit']
+
+    @classmethod
+    def setUpClass(cls):
+        sql('CREATE SCHEMA delta_statio_tests; '
+            'CREATE TABLE delta_statio_tests.heap(id integer, payload integer) '
+            'WITH (autovacuum_enabled=false); '
+            'CREATE TABLE delta_statio_tests.indexed(id integer PRIMARY KEY, payload integer) '
+            'WITH (autovacuum_enabled=false); '
+            'CREATE TABLE delta_statio_tests.toasted(id integer PRIMARY KEY, payload text) '
+            'WITH (autovacuum_enabled=false, toast.autovacuum_enabled=false); '
+            'ALTER TABLE delta_statio_tests.toasted ALTER COLUMN payload SET STORAGE EXTERNAL; '
+            'INSERT INTO delta_statio_tests.heap SELECT i,i FROM generate_series(1,1000) i; '
+            'INSERT INTO delta_statio_tests.indexed SELECT i,i FROM generate_series(1,1000) i; '
+            'INSERT INTO delta_statio_tests.toasted SELECT i,repeat(md5(i::text),500) '
+            'FROM generate_series(1,20) i; SELECT pg_stat_force_next_flush();')
+
+    @classmethod
+    def tearDownClass(cls):
+        sql('DROP SCHEMA delta_statio_tests CASCADE')
+
+    def io_sample(self, action, table='heap', prefix=''):
+        rows = self.sample(action, prefix, 'pg_statio_user_tables_delta',
+                           f"schemaname='delta_statio_tests' AND relname='{table}'")
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(rows[0]['elapsed_seconds'], 1.5)
+        return rows[0]
+
+    def test_heap_and_cache_modes(self):
+        for mode in ['none', 'cache', 'snapshot']:
+            row = self.io_sample(lambda: sql(
+                'SELECT sum(payload) FROM delta_statio_tests.heap; '
+                'SELECT pg_stat_force_next_flush();'),
+                prefix=f"BEGIN; SET LOCAL stats_fetch_consistency='{mode}'; "
+                       'SELECT count(*) FROM pg_statio_user_tables; ')
+            self.assertEqual(row['status'], 'ok')
+            self.assertGreater(row['heap_blks_hit_delta'], 0)
+            self.assertGreaterEqual(row['heap_blks_read_delta'], 0)
+            for name in ['idx_blks_read', 'idx_blks_hit', 'toast_blks_read',
+                         'toast_blks_hit', 'tidx_blks_read', 'tidx_blks_hit']:
+                self.assertIsNone(row[name+'_delta'])
+
+    def test_index_io(self):
+        row = self.io_sample(lambda: sql(
+            'SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=off; '
+            'SELECT sum(payload) FROM delta_statio_tests.indexed WHERE id BETWEEN 1 AND 50; '
+            'SELECT pg_stat_force_next_flush();'), table='indexed')
+        self.assertEqual(row['status'], 'ok')
+        self.assertGreater(row['idx_blks_hit_delta'], 0)
+        self.assertGreater(row['heap_blks_hit_delta'], 0)
+
+    def test_toast_io(self):
+        # md5 forces payload access; length alone can use external-value metadata.
+        row = self.io_sample(lambda: sql(
+            'SELECT md5(payload) FROM delta_statio_tests.toasted; '
+            'SELECT pg_stat_force_next_flush();'), table='toasted')
+        self.assertEqual(row['status'], 'ok')
+        self.assertGreater(row['toast_blks_hit_delta'], 0)
+        self.assertGreater(row['tidx_blks_hit_delta'], 0)
+
+    def test_table_reset(self):
+        row = self.io_sample(lambda: sql(
+            "SELECT pg_stat_reset_single_table_counters('delta_statio_tests.heap'::regclass)"))
+        self.assertEqual(row['status'], 'reset')
+        for name in self.counters:
+            self.assertIsNone(row[name+'_delta'])
+
+    def test_index_reset(self):
+        row = self.io_sample(lambda: sql(
+            "SELECT pg_stat_reset_single_table_counters('delta_statio_tests.indexed_pkey'::regclass)"),
+            table='indexed')
+        self.assertEqual(row['status'], 'reset')
+        self.assertIsNone(row['idx_blks_hit_delta'])
+
+    def test_database_reset(self):
+        row = self.io_sample(lambda: sql('SELECT pg_stat_reset()'))
+        self.assertEqual(row['status'], 'reset')
+        self.assertIsNone(row['heap_blks_hit_delta'])
+
+    def test_catalog_snapshot_and_drop(self):
+        sql('CREATE TABLE delta_statio_tests.before_rename(id integer) '
+            'WITH (autovacuum_enabled=false); '
+            'INSERT INTO delta_statio_tests.before_rename SELECT generate_series(1,10); '
+            'SELECT sum(id) FROM delta_statio_tests.before_rename; '
+            'SELECT pg_stat_force_next_flush();')
+        try:
+            rows = self.sample(lambda: sql(
+                'ALTER TABLE delta_statio_tests.before_rename RENAME TO after_rename; '
+                'CREATE TABLE delta_statio_tests.created_during_sample(id integer)'),
+                function='pg_statio_user_tables_delta')
+            names = [r['relname'] for r in rows if r['schemaname']=='delta_statio_tests']
+            self.assertIn('before_rename', names)
+            self.assertNotIn('after_rename', names)
+            self.assertNotIn('created_during_sample', names)
+            row = self.io_sample(lambda: sql('DROP TABLE delta_statio_tests.after_rename'),
+                                 table='after_rename')
+            self.assertEqual(row['status'], 'counter_decreased')
+            self.assertIsNone(row['heap_blks_hit_delta'])
+        finally:
+            sql('DROP TABLE IF EXISTS delta_statio_tests.before_rename, '
+                'delta_statio_tests.after_rename, delta_statio_tests.created_during_sample')
+
+    def test_user_scope_validation_and_repeat(self):
+        self.assertEqual(sql("SELECT count(*)>0 FROM pg_statio_user_tables_delta(0) "
+                             "WHERE schemaname='pg_catalog'"), 'f')
+        self.assertEqual(sql("SELECT count(*)>0 FROM pg_statio_user_tables_delta(0) "
+                             "WHERE schemaname='pg_toast'"), 'f')
+        for value in ['NULL', '-1', "'NaN'", "'Infinity'", "'-Infinity'"]:
+            result = subprocess.run([PSQL, '-X', '-v', 'ON_ERROR_STOP=1', '-c',
+                                     f'SELECT * FROM pg_statio_user_tables_delta({value})'],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('finite nonnegative', result.stderr)
+        result = sql('BEGIN; '
+                     "SET LOCAL stats_fetch_consistency='snapshot'; "
+                     'SELECT count(*)>0 FROM pg_statio_user_tables_delta(0); '
+                     'SELECT count(*)>0 FROM pg_statio_user_tables_delta(0); COMMIT;')
+        self.assertEqual(result.splitlines().count('t'), 2)
+
+
+class IndexIODeltaTests(unittest.TestCase):
+    sample = DeltaTests.sample
+
+    @classmethod
+    def setUpClass(cls):
+        sql('CREATE SCHEMA delta_index_io_tests; '
+            'CREATE TABLE delta_index_io_tests.items(id integer PRIMARY KEY, payload integer) '
+            'WITH (autovacuum_enabled=false); '
+            'INSERT INTO delta_index_io_tests.items SELECT i,i FROM generate_series(1,1000) i; '
+            'SELECT pg_stat_force_next_flush();')
+
+    @classmethod
+    def tearDownClass(cls):
+        sql('DROP SCHEMA delta_index_io_tests CASCADE')
+
+    def io_sample(self, action, index='items_pkey', prefix=''):
+        rows = self.sample(action, prefix, 'pg_statio_user_indexes_delta',
+                           f"schemaname='delta_index_io_tests' AND indexrelname='{index}'")
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(rows[0]['elapsed_seconds'], 1.5)
+        return rows[0]
+
+    def test_hits_and_cache_modes(self):
+        for mode in ['none', 'cache', 'snapshot']:
+            row = self.io_sample(lambda: sql(
+                'SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=off; '
+                'SELECT sum(payload) FROM delta_index_io_tests.items WHERE id BETWEEN 1 AND 50; '
+                'SELECT pg_stat_force_next_flush();'),
+                prefix=f"BEGIN; SET LOCAL stats_fetch_consistency='{mode}'; "
+                       'SELECT count(*) FROM pg_statio_user_indexes; ')
+            self.assertEqual(row['status'], 'ok')
+            self.assertGreater(row['idx_blks_hit_delta'], 0)
+            self.assertGreaterEqual(row['idx_blks_read_delta'], 0)
+
+    def test_separate_indexes(self):
+        sql('CREATE INDEX payload_idx ON delta_index_io_tests.items(payload)')
+        query = 'SELECT sum(payload) FROM delta_index_io_tests.items WHERE id BETWEEN 1 AND 50; '
+        try:
+            rows = self.sample(lambda: sql(
+                'SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=off; '
+                + query * 10 + 'SELECT pg_stat_force_next_flush();'),
+                function='pg_statio_user_indexes_delta', condition="schemaname='delta_index_io_tests'")
+            by_name = {r['indexrelname']: r for r in rows}
+            active, idle = by_name['items_pkey'], by_name['payload_idx']
+            self.assertEqual(active['relid'], idle['relid'])
+            self.assertNotEqual(active['indexrelid'], idle['indexrelid'])
+            self.assertEqual(active['status'], 'ok')
+            self.assertEqual(idle['status'], 'ok')
+            self.assertGreater(active['idx_blks_hit_delta'], 0)
+            # The planner can access metadata pages of an unused index too.
+            self.assertGreaterEqual(idle['idx_blks_read_delta'], 0)
+            self.assertGreaterEqual(idle['idx_blks_hit_delta'], 0)
+            self.assertGreater(active['idx_blks_hit_delta'], idle['idx_blks_hit_delta'])
+        finally:
+            sql('DROP INDEX delta_index_io_tests.payload_idx')
+
+    def test_index_reset(self):
+        row = self.io_sample(lambda: sql(
+            "SELECT pg_stat_reset_single_table_counters('delta_index_io_tests.items_pkey'::regclass)"))
+        self.assertEqual(row['status'], 'reset')
+        self.assertIsNone(row['idx_blks_read_delta'])
+        self.assertIsNone(row['idx_blks_hit_delta'])
+
+    def test_database_reset(self):
+        row = self.io_sample(lambda: sql('SELECT pg_stat_reset()'))
+        self.assertEqual(row['status'], 'reset')
+        self.assertIsNone(row['idx_blks_read_delta'])
+        self.assertIsNone(row['idx_blks_hit_delta'])
+
+    def test_catalog_snapshot(self):
+        try:
+            rows = self.sample(lambda: sql(
+                'ALTER INDEX delta_index_io_tests.items_pkey RENAME TO renamed_pkey; '
+                'CREATE INDEX created_during_sample ON delta_index_io_tests.items(payload)'),
+                function='pg_statio_user_indexes_delta')
+            names = [r['indexrelname'] for r in rows if r['schemaname']=='delta_index_io_tests']
+            self.assertIn('items_pkey', names)
+            self.assertNotIn('renamed_pkey', names)
+            self.assertNotIn('created_during_sample', names)
+        finally:
+            sql('DROP INDEX IF EXISTS delta_index_io_tests.created_during_sample; '
+                'ALTER INDEX delta_index_io_tests.renamed_pkey RENAME TO items_pkey;')
+
+    def test_dropped_index(self):
+        sql('CREATE TABLE delta_index_io_tests.dropped(id integer) '
+            'WITH (autovacuum_enabled=false); '
+            'CREATE INDEX dropped_idx ON delta_index_io_tests.dropped(id); '
+            'INSERT INTO delta_index_io_tests.dropped SELECT generate_series(1,100); '
+            'SELECT pg_stat_force_next_flush();')
+        row = self.io_sample(lambda: sql('DROP INDEX delta_index_io_tests.dropped_idx'), index='dropped_idx')
+        self.assertEqual(row['status'], 'counter_decreased')
+        self.assertIsNone(row['idx_blks_hit_delta'])
+
+    def test_user_scope_validation_and_repeat(self):
+        self.assertEqual(sql("SELECT count(*) FROM pg_statio_user_indexes_delta(0) "
+                             "WHERE schemaname IN ('pg_catalog', 'pg_toast')"), '0')
+        for value in ['NULL', '-1', "'NaN'", "'Infinity'", "'-Infinity'"]:
+            result = subprocess.run([PSQL, '-X', '-v', 'ON_ERROR_STOP=1', '-c',
+                                     f'SELECT * FROM pg_statio_user_indexes_delta({value})'],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('finite nonnegative', result.stderr)
+        result = sql('BEGIN; '
+                     "SET LOCAL stats_fetch_consistency='snapshot'; "
+                     'SELECT count(*)>0 FROM pg_statio_user_indexes_delta(0); '
+                     'SELECT count(*)>0 FROM pg_statio_user_indexes_delta(0); COMMIT;')
+        self.assertEqual(result.splitlines().count('t'), 2)
+
+
+class InstallationTests(unittest.TestCase):
+    def test_single_version_install(self):
+        name = 'delta_test_installation'
+        functions = ['pg_stat_database_delta', 'pg_stat_user_tables_delta',
+                     'pg_stat_user_indexes_delta', 'pg_statio_user_tables_delta',
+                     'pg_statio_user_indexes_delta']
+        sql(f'CREATE DATABASE {name}')
+        try:
+            self.assertEqual(sql("SELECT version FROM pg_available_extension_versions "
+                                 "WHERE name='pg_stat_delta' ORDER BY version", PGDATABASE=name), '0.1.0')
+            sql('CREATE SCHEMA diagnostics', PGDATABASE=name)
+            for schema in ['public', 'diagnostics']:
+                # Test both the default version and explicit 0.1.0 selection.
+                version = " VERSION '0.1.0'" if schema == 'diagnostics' else ''
+                sql(f'CREATE EXTENSION pg_stat_delta SCHEMA {schema}' + version, PGDATABASE=name)
+                self.assertEqual(sql("SELECT extversion FROM pg_extension WHERE extname='pg_stat_delta'",
+                                     PGDATABASE=name), '0.1.0')
+                for function in functions:
+                    rows = sql(f'SELECT count(*) FROM {schema}.{function}(0)', PGDATABASE=name)
+                    if function == 'pg_stat_database_delta':
+                        self.assertGreater(int(rows), 0)
+                    else:
+                        self.assertEqual(rows, '0')
+                # All five functions must be extension members, not loose SQL objects.
+                self.assertEqual(sql("SELECT count(*) FROM pg_depend d "
+                                     "JOIN pg_extension e ON e.oid=d.refobjid "
+                                     "JOIN pg_proc p ON p.oid=d.objid "
+                                     "WHERE e.extname='pg_stat_delta' AND d.deptype='e' "
+                                     "AND d.classid='pg_proc'::regclass "
+                                     "AND d.refclassid='pg_extension'::regclass",
+                                     PGDATABASE=name), '5')
+                start = time.monotonic()
+                sql(f'SELECT count(*) FROM {schema}.pg_statio_user_indexes_delta(0.1)', PGDATABASE=name)
+                self.assertGreaterEqual(time.monotonic() - start, .1)
+                sql('DROP EXTENSION pg_stat_delta', PGDATABASE=name)
+                for function in functions:
+                    self.assertEqual(sql(f"SELECT to_regprocedure('{schema}.{function}(numeric)') IS NULL",
+                                         PGDATABASE=name), 't')
+        finally:
+            sql(f'DROP DATABASE {name}')
 
 
 if __name__ == '__main__':
