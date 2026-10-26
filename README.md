@@ -4,8 +4,56 @@ On-demand PostgreSQL statistics deltas, without snapshot tables or background
 workers. Version 0.1.0 provides `pg_stat_database_delta`,
 `pg_stat_user_tables_delta`, `pg_stat_user_indexes_delta`,
 `pg_statio_user_tables_delta`, and `pg_statio_user_indexes_delta`.
-Each accepts `seconds numeric DEFAULT 5`.
+Each accepts `i_delta_seconds numeric DEFAULT 5`.
 Implemented in PL/pgSQL; currently tested on **PostgreSQL 17.11**.
+
+## Functions and shared behavior
+
+| Function | Source | Snapshot key |
+| --- | --- | --- |
+| `pg_stat_database_delta` | `pg_stat_database` | `datid` |
+| `pg_stat_user_tables_delta` | `pg_stat_user_tables` | `relid` |
+| `pg_stat_user_indexes_delta` | `pg_stat_user_indexes` | `indexrelid` |
+| `pg_statio_user_tables_delta` | `pg_statio_user_tables` | `relid` |
+| `pg_statio_user_indexes_delta` | `pg_statio_user_indexes` | `indexrelid` |
+
+Each call reads two flat snapshots in one SQL query, waits between them, clears
+the statistics cache for each read, and matches rows with FULL OUTER JOIN. All
+functions return `sampled_at_start`, `sampled_at_end`, `elapsed_seconds` and
+`status`. Cumulative differences use `_delta`; state estimates and last-event
+timestamps are separate values. Database scope includes its shared-object row;
+the four relation samplers follow their source user views in the current database.
+
+| Status | Meaning | Availability |
+| --- | --- | --- |
+| `ok` | No discontinuity detected; source NULLs remain NULL | All functions |
+| `reset` | A reset marker changed; table/index statistics also use this for counter decreases | All functions |
+| `counter_decreased` | A block counter decreased without a changed reset marker | Both I/O functions |
+| `missing` | An identity exists in only one sampled row set | All functions |
+
+**Every cumulative delta is NULL for a non-ok row.** Connection counts, table
+state estimates and last-event times can remain available where a snapshot exists.
+A valid zero means no published counter change; NULL means unavailable or invalid,
+not zero activity. `ok` does not certify an atomic measurement or absence of DDL.
+The single statement retains its MVCC catalog snapshot, so `missing` is defensive
+and does not promise live discovery of newly created objects during the wait.
+
+PostgreSQL 17's `stats_fetch_consistency` controls transaction-local statistics
+caching, independently of the data buffer cache:
+
+| Mode | Statistics reads within the transaction |
+| --- | --- |
+| `none` | Read currently published values without retaining a statistics cache |
+| `cache` (default) | Cache an object's statistics on first access |
+| `snapshot` | Cache a statistics snapshot on first access |
+
+`pg_stat_clear_snapshot()` discards this cached state. It does not force other
+backends to publish pending counters. Short intervals can therefore miss recent
+work or include earlier work published during measurement. The actual elapsed
+seconds can exceed the requested wait; callers can cancel or use statement_timeout.
+
+The current implementation/plan comparisons are indexed in
+[docs/performance.md](docs/performance.md).
 
 ## Design priority
 
@@ -68,13 +116,20 @@ by PostgreSQL by default; administrators can revoke it).
 
 ## Database statistics
 
-Each call uses one SQL query: two materialized statistics snapshots are combined
-with `UNION ALL`, then `lag()` computes the preceding values per database OID.
-Rows stay in PostgreSQL's native record format; there is no JSON serialization.
-Materialized CTE dependencies enforce complete first read → sleep → cache clear
-→ second read, independently of the execution order of UNION ALL branches.
-`OFFSET` subqueries force cache clearing before each statistics scan. No
-persistent objects are created per measurement.
+The database function uses one SQL query with two materialized, **flat**
+`pg_stat_database` snapshots, matched by `FULL OUTER JOIN`. This is the baseline
+for further database-query optimization. It avoids composite-record field access,
+`UNION ALL` and window functions. The table and index samplers also use full joins,
+as described below.
+All five samplers now use flat snapshots and FULL OUTER JOIN, with explicit
+pre-scan cache-clear barriers retained for the aggregate table views.
+
+`pg_stat_clear_snapshot()` runs for each read through the singleton clear CTE.
+Aggregates in `first_time` and `second_time` fully consume their respective
+snapshots and yield one timing row. The second clear depends on the sleep.
+The final join preserves a row even if only one snapshot contains its OID.
+Native scalar types are retained throughout, without JSON or persistent tables.
+The result is ordered by database OID.
 
 Rows are matched by `datid`, including PostgreSQL's shared-object row (`datid=0`,
 NULL database name).
@@ -84,18 +139,37 @@ NULL database name).
 | `datid`, `datname` | Database OID and name visible at the start of the query |
 | `sampled_at_start`, `sampled_at_end` | Wall-clock timestamps immediately after each snapshot read |
 | `elapsed_seconds` | Actual elapsed seconds between those timestamps |
-| `status` | `ok` or `reset` |
-| `stats_reset_start`, `stats_reset_end` | Reset timestamps from both snapshots |
+| `status` | `ok`, `reset`, or `missing` |
 | `num_backends_start`, `num_backends_end`, `num_backends_delta` | Connection counts and their signed difference |
 | `xact_commit_delta`, `xact_rollback_delta` | Transaction counter deltas |
 | `blks_read_delta`, `blks_hit_delta` | Block counter deltas |
 | `tup_returned_delta`, `tup_fetched_delta`, `tup_inserted_delta`, `tup_updated_delta`, `tup_deleted_delta` | Tuple counter deltas |
 | `temp_files_delta`, `temp_bytes_delta`, `deadlocks_delta` | Temporary-file and deadlock counter deltas |
 | `blk_read_time_delta`, `blk_write_time_delta` | I/O time deltas in milliseconds; depend on `track_io_timing` |
+| `session_time_delta`, `active_time_delta`, `idle_in_transaction_time_delta` | Published session, active, and idle-in-transaction time deltas in milliseconds |
+| `sessions_delta` | Change in established sessions, not the instantaneous connection count |
 
-For `reset`, **all cumulative counter deltas are NULL**. Connection measurements
-remain available. A changed `stats_reset` identifies a reset; unchanged NULL
-reset timestamps are accepted.
+For `reset` or `missing`, **all cumulative counter deltas are NULL**. Connection
+measurements remain available wherever the snapshot exists. `stats_reset` is
+compared internally; equal NULL markers are accepted. `missing` denotes an OID
+present in only one snapshot and is a defensive case, not a promise of live
+catalog refresh. The statement still uses one MVCC catalog snapshot.
+
+Session time fields are published cumulative statistics, not stopwatches sampled
+continuously by this function. They can include time accrued before the interval
+but published during it. Values are milliseconds, while `elapsed_seconds` is
+seconds. `sessions_delta` counts newly established sessions and is distinct from
+`num_backends_delta` (a change in current connections).
+
+This development revision changes the returned row type: it adds four session
+fields and removes `stats_reset_start` / `stats_reset_end` from the public result.
+Existing SQL using those fields or positional SELECT * results needs adjustment.
+PostgreSQL cannot apply this return-type change with CREATE OR REPLACE FUNCTION;
+reload the development extension using the recreation instructions above. The
+extension remains version 0.1.0.
+
+See [docs/database-query.md](docs/database-query.md) for the plan comparison,
+measurements and the scope of execution-order validation.
 
 Calculate rates explicitly using actual duration, for example:
 
@@ -114,61 +188,67 @@ connection; normal query cancellation and `statement_timeout` apply.
 ```sql
 SELECT schemaname, relname, status,
        seq_scan_delta, idx_scan_delta,
-       n_tup_ins_delta, n_tup_upd_delta, n_tup_del_delta
+       n_tup_ins_delta, n_tup_upd_delta, n_tup_del_delta,
+       n_live_tup, n_dead_tup, last_analyze
 FROM pg_stat_user_tables_delta(2)
 ORDER BY schemaname, relname;
 ```
 
-The function samples `pg_stat_user_tables` in the **current database**. It uses the
-same single-query, native-record, `UNION ALL` / `lag()` approach, matching by `relid`.
-No JSON, dynamic SQL, per-table queries, or snapshot tables are used. It returns
-all user-table rows, including unchanged ones. An outer WHERE filters the result,
-not the sampling work. No output ordering is promised; add ORDER BY if needed.
+The function samples `pg_stat_user_tables` in the **current database**. Flat native
+snapshots are matched by `relid` using FULL OUTER JOIN, without JSON, dynamic SQL,
+per-table queries or persistent snapshots. Only required columns are read; the
+first snapshot does not collect the second snapshot's state fields. Results are
+ordered by schema and table name. An outer WHERE filters the result, not sampling.
 
 | Columns | Meaning |
 | --- | --- |
 | `relid`, `schemaname`, `relname` | Identity and names from the statement's catalog snapshot |
-| `sampled_at_start`, `sampled_at_end`, `elapsed_seconds` | Same timing semantics as the database function |
-| `status` | `ok` (no discontinuity detected), `reset`, or `counter_decreased` |
-| `database_stats_reset_start`, `database_stats_reset_end` | Current database reset timestamps, read once per snapshot |
-| `seq_scan_delta`, `seq_tup_read_delta` | Sequential scan counters |
-| `idx_scan_delta`, `idx_tup_fetch_delta` | Index scan counters; NULL is preserved for tables without indexes |
-| `n_tup_ins_delta`, `n_tup_upd_delta`, `n_tup_del_delta` | Tuple modification counters |
-| `n_tup_hot_upd_delta`, `n_tup_newpage_upd_delta` | HOT and new-page update counters; subsets of updates, not additional operations |
-| `vacuum_count_delta`, `autovacuum_count_delta`, `analyze_count_delta`, `autoanalyze_count_delta` | Maintenance operation counters |
-| `n_live_tup_*`, `n_dead_tup_*` | Estimated live/dead tuple counts: `_start`, `_end`, and signed `_delta` |
-| `n_mod_since_analyze_*`, `n_ins_since_vacuum_*` | Counts since maintenance: `_start`, `_end`, and signed `_delta` |
-| `last_seq_scan_end`, `last_idx_scan_end`, `last_vacuum_end`, `last_autovacuum_end`, `last_analyze_end`, `last_autoanalyze_end` | Last-event timestamps in the second snapshot; never subtracted |
+| `sampled_at_start`, `sampled_at_end`, `elapsed_seconds` | Actual timing, as with the database function |
+| `status` | `ok`, `reset` (a reset/discontinuity was detected), or `missing` |
+| `seq_scan_delta`, `seq_tup_read_delta` | Sequential scan counter deltas |
+| `idx_scan_delta`, `idx_tup_fetch_delta` | Index scan counter deltas; NULL is preserved for tables without indexes |
+| `n_tup_ins_delta`, `n_tup_upd_delta`, `n_tup_del_delta` | Tuple modification counter deltas |
+| `n_tup_hot_upd_delta`, `n_tup_newpage_upd_delta` | HOT and new-page update deltas; subsets of updates, not extra operations |
+| `n_live_tup`, `n_dead_tup` | Estimated live/dead tuple counts in the second snapshot |
+| `n_mod_since_analyze`, `n_ins_since_vacuum` | Counts since maintenance in the second snapshot |
+| `last_vacuum`, `last_autovacuum`, `last_analyze`, `last_autoanalyze` | Last maintenance times in the second snapshot |
 
-A changed database reset timestamp produces `reset`. In PostgreSQL 17,
-`pg_stat_reset_single_table_counters()` also changes that timestamp, so even a
-reset followed by counters catching up is detected. This database-wide marker
-cannot identify the affected table: a table (or function) reset conservatively
-invalidates **every table's** cumulative deltas in that sample. There is no
-per-table reset timestamp in this view.
+The database reset marker is read **once per snapshot**, not per table. In
+PostgreSQL 17 a single-table reset also updates that marker. This catches resets
+even if subsequent activity has brought all table counters above their old values.
+The marker does not identify the affected table, so a table/function reset
+conservatively invalidates all tables' cumulative deltas in the sample.
 
-If any available cumulative counter decreases without a changed reset marker,
-status is `counter_decreased` (for example, a dropped table's statistics can
-vanish while its catalog row is still visible). For either invalid status, all
-cumulative deltas are NULL. A decrease is evidence of a discontinuity, not proof
-of its cause. `ok` does not certify that no concurrent DDL or statistics changes
-occurred; statistics across objects are not atomic.
+Any decrease in the nine returned cumulative counters also produces `reset`;
+this denotes an unreliable measurement, not proof of the cause (dropping an index
+can decrease aggregated index counters too). For reset or missing rows **all nine
+cumulative deltas are NULL**. Checking only scan counters or independently masking
+negative deltas is insufficient to establish validity. `ok` means no discontinuity
+was detected; snapshots across objects are not globally atomic.
 
-State estimates and counts since maintenance retain their raw before/after
-values and signed differences, even for invalid samples. They are **not event
-rates**: ANALYZE, VACUUM, TRUNCATE and resets can change or reduce them. Scan and
-tuple counters describe PostgreSQL's published physical activity, not necessarily
-committed logical changes or a sum over an inheritance/partition hierarchy.
-The function preserves the source view's relation types and per-relation scope.
-`track_counts` and statistics publication affect what is observable.
+State estimates and maintenance timestamps come directly from the second
+snapshot, even for reset/missing-before rows. They are not subtracted or converted
+to event rates. Missing-after rows have NULL end-state fields. ANALYZE, VACUUM,
+TRUNCATE or a reset can decrease state values without implying a cumulative-counter
+reset. Table counters retain the source view's physical/per-relation scope and
+are not necessarily committed logical changes or sums over partition hierarchies.
 
-As with the database function, creation, rename and drop during the wait do not
-refresh the statement's catalog snapshot. New tables appear on the next call;
-renamed tables retain their initial names; dropped tables may retain a row with
-invalid deltas. No attempt is made to lock user tables or prevent DDL.
+This development revision removes the public database-reset timestamps,
+maintenance-count deltas, scan timestamps, and state `_start`/`_end`/`_delta`
+triples. It returns the compact end-state fields listed above instead. Recreate
+the development extension to load this changed return type; CREATE OR REPLACE
+FUNCTION cannot change the old returned row type in place. Version stays 0.1.0.
 
-Plan inspection and a small scaling measurement are documented in
-[docs/performance.md](docs/performance.md).
+The source view aggregates index statistics, so snapshot reads retain explicit
+cache-clear OFFSET dependencies. See [docs/table-query.md](docs/table-query.md)
+for why the proposed cross joins alone are not used as ordering guarantees, the
+reset regression tests, and the three-way performance comparison.
+
+Creation, rename and drop during the wait do not refresh the statement's catalog
+snapshot. New tables appear on the next call; renamed tables retain their initial
+names; dropped tables may retain a row with invalid deltas. `track_counts` and
+statistics publication delays affect observations. No table locks are added to
+prevent DDL.
 
 ## User-index statistics
 
@@ -180,18 +260,19 @@ ORDER BY schemaname, relname, indexrelname;
 ```
 
 The source is `pg_stat_user_indexes` in the current database. The function reads
-that view twice, retains native records and matches snapshots by **indexrelid**,
+required scalar columns into two flat snapshots and uses FULL OUTER JOIN by **indexrelid**,
 not index name or table OID. This keeps different indexes on the same table
-separate. There is one window sort and no final output sort, JSON conversion,
-per-index query, or persistent snapshot. An outer WHERE filters output, not the
-two statistics scans. Idle indexes are included.
+separate. There is no window function, JSON conversion, per-index query or
+persistent snapshot. The first snapshot omits the last-scan timestamp, which is
+only needed from the second. Results are sorted by schema, table and index name.
+An outer WHERE filters output, not the two statistics scans. Idle indexes are included.
 
 | Columns | Meaning |
 | --- | --- |
 | `relid`, `indexrelid` | Table and index OIDs |
 | `schemaname`, `relname`, `indexrelname` | Names from the statement's catalog snapshot |
 | `sampled_at_start`, `sampled_at_end`, `elapsed_seconds` | Same actual timing semantics as other samplers |
-| `status`, `database_stats_reset_start`, `database_stats_reset_end` | Same conservative reset/decrease handling as the table sampler |
+| `status` | `ok`, `reset` (a detected reset/discontinuity), or `missing` |
 | `idx_scan_delta` | Change in index scans/searches, not a count of SQL queries |
 | `idx_tup_read_delta` | Change in index entries returned by scans |
 | `idx_tup_fetch_delta` | Change in live table rows fetched by simple index scans using this index |
@@ -211,11 +292,26 @@ Counter interpretation matters:
 - These are scan/tuple counters, not disk I/O or a measure of index usefulness.
   The function does not calculate sizes or join unrelated I/O views.
 
-A changed database reset marker returns `reset` for every index. In PostgreSQL
-17, `pg_stat_reset_single_table_counters(index_oid)` can reset index statistics
-and also changes that database marker. Any decreased cumulative counter without
-a changed marker gives `counter_decreased`; all three cumulative deltas are NULL
-for either invalid status. The last scan timestamp remains the raw second value.
+The database reset marker is still read once per snapshot internally, but is no
+longer returned as public columns. A marker change returns `reset` for every
+index, including a reset whose counters have already grown past their baseline.
+In PostgreSQL 17, `pg_stat_reset_single_table_counters(index_oid)` changes that
+marker too. Any decrease among the three counters also produces `reset`; this
+marks a discontinuity rather than proving its cause. A missing snapshot row
+produces `missing`.
+
+For either invalid status **all three cumulative deltas are NULL**, not only the
+decreasing counter's delta. `last_idx_scan_end` is the raw second-snapshot value,
+even for reset or missing-before rows; it is NULL for a missing-after row.
+
+This revision removes `database_stats_reset_start` and `database_stats_reset_end`
+from the public result and replaces `counter_decreased` with `reset` for counter
+decreases. The extension stays version 0.1.0. Recreate the development extension
+as documented above to apply the changed return type; CREATE OR REPLACE FUNCTION
+cannot change the old returned row type in place.
+
+See [docs/index-query.md](docs/index-query.md) for the original proposal's reset
+regressions, execution-plan checks, and performance comparison.
 
 Catalog snapshot and publication limitations also apply here. New/rebuilt indexes
 with new OIDs may appear only on the next call; renames retain the original names;
@@ -237,28 +333,41 @@ ORDER BY schemaname, relname;
 
 The source is **pg_statio_user_tables**, in the current database. System and
 TOAST relations are excluded as separate rows, exactly as in that view; each
-user table still has its own index and TOAST counters. Snapshots are matched by
-`relid`, with the same explicit ordering, native records, window-based deltas,
-conservative reset handling, and catalog/publication limitations as other samplers.
-There is no JSON, per-table query, write, or explicit final sort. An outer WHERE
-only filters output, not sampling work. Unchanged user tables are included.
+user table still has its own index and TOAST counters. Flat snapshots are matched
+by `relid` with FULL OUTER JOIN. The function keeps native scalar types, explicit
+pre-scan cache-clear dependencies, and conservative validity checks. There is no
+JSON, per-table query or persistent write. Results are sorted by schema and table
+name. An outer WHERE only filters output, not sampling work; unchanged user tables
+are included.
 
 | Columns | Meaning |
 | --- | --- |
 | `relid`, `schemaname`, `relname` | Table identity and names in the catalog snapshot |
 | `sampled_at_start`, `sampled_at_end`, `elapsed_seconds` | Actual timing, as in other samplers |
-| `status`, `database_stats_reset_start`, `database_stats_reset_end` | `ok`, `reset`, or `counter_decreased`, with the database reset marker |
+| `status` | `ok`, `reset`, `counter_decreased`, or `missing` |
 | `heap_blks_read_delta`, `heap_blks_hit_delta` | Table heap block reads and buffer hits |
 | `idx_blks_read_delta`, `idx_blks_hit_delta` | Block reads and hits summed over the table's indexes |
 | `toast_blks_read_delta`, `toast_blks_hit_delta` | Associated TOAST heap reads and hits |
 | `tidx_blks_read_delta`, `tidx_blks_hit_delta` | Associated TOAST index reads and hits |
 
 All eight counters are bigint differences. NULL is preserved for unavailable
-components (for example, no index or no TOAST). A reset marker change, including
-an index/table reset in PostgreSQL 17, invalidates all cumulative deltas. Any
-decreasing component without a marker change yields `counter_decreased` and also
-makes all eight deltas NULL. Aggregated index counters can decrease when indexes
-are dropped or replaced; these statuses do not identify the particular cause.
+components (for example, no index or no TOAST). The database reset marker is read
+once per snapshot internally, without being returned as extra columns. A marker
+change, including an index/table reset in PostgreSQL 17, yields `reset`. Any
+decreasing component without a marker change yields `counter_decreased`.
+A missing snapshot row yields `missing`.
+
+**All eight deltas are NULL for every non-ok status**, even when some counters
+are zero, unchanged or already above their pre-reset values. Independent
+nonnegative subtraction is insufficient after a reset. Aggregated index counters
+can decrease when indexes are dropped or replaced; statuses do not prove a
+particular cause.
+
+The two public database-reset timestamp columns have been removed, as requested
+in the compact signature. Reload the development extension to apply this changed
+return type; CREATE OR REPLACE FUNCTION cannot change the old row type in place.
+Version remains 0.1.0. See [docs/table-io-query.md](docs/table-io-query.md) for the
+proposed-query regression, execution ordering and performance comparison.
 
 `*_blks_read` counts PostgreSQL block reads, **not necessarily physical device
 reads**: the operating system may serve a read from its cache. `*_blks_hit` counts
@@ -300,18 +409,26 @@ The counters contain no write counts or latency. Even an index unused by an
 executor can receive I/O from planner metadata probes; a zero-query workload
 for that index does not guarantee zero index I/O.
 
-The result also includes `sampled_at_start`, `sampled_at_end`, `elapsed_seconds`,
-`status`, `database_stats_reset_start` and `database_stats_reset_end`. A changed
-reset marker produces `reset`; a decreased counter produces `counter_decreased`.
-Both deltas are NULL for either invalid status. PostgreSQL 17 index/table resets
-update the database marker and conservatively invalidate all indexes' deltas.
+The result also includes `sampled_at_start`, `sampled_at_end`, `elapsed_seconds`
+and `status`. The database reset marker is read once per snapshot internally;
+it is no longer returned as public timestamp columns. A changed marker produces
+`reset`; any decreased counter produces `counter_decreased`; an absent snapshot
+row produces `missing`. **Both deltas are NULL for every non-ok status**, even if
+one counter is zero, unchanged or has recovered past its pre-reset value.
+PostgreSQL 17 index/table resets update the database marker and conservatively invalidate all indexes' deltas.
 
-The same cache-clear dependencies, single-query UNION ALL / lag approach,
-catalog snapshot and publication limitations apply. There is no JSON conversion
-or explicit final sort. Indexes created or replaced with new OIDs during the wait
-appear on the next call; renames retain their initial names; dropped indexes can
+Flat snapshots are matched with FULL OUTER JOIN by `indexrelid`, independently
+of other indexes sharing the table `relid`. The timing aggregates and clear/sleep
+dependencies remain. There is no JSON, window function or per-index query. Results
+are sorted by schema, table and index name. Indexes created or replaced with new
+OIDs during the wait appear on the next call; renames retain their initial names; dropped indexes can
 retain a catalog row with vanished counters. Unchanged indexes are returned too,
 and an outer WHERE does not reduce sampling work. Add ORDER BY if needed.
+
+The public reset timestamp columns were removed to match the compact signature.
+Reload the development extension to apply the new return type; CREATE OR REPLACE
+FUNCTION cannot change that row type in place. All functions stay version 0.1.0.
+See [docs/index-io-query.md](docs/index-io-query.md) for validation and measurements.
 
 The optional private-cluster check above now also verifies positive per-index
 block-read deltas after a second clean restart of that temporary cluster.
@@ -337,12 +454,23 @@ block-read deltas after a second clean restart of that temporary cluster.
 
 ## Integration tests
 
+The suite currently contains **54 integration test methods**; some exercise
+multiple cache modes or edge cases. The complete suite passed on PostgreSQL 17.11
+with the current five-function implementation. The optional private-cluster cold
+block-read check also passed.
+
 Tests require Python 3, `psql`, and a running PostgreSQL 17 server. Use a
 **disposable test database and cluster**: tests reset database statistics, create
 and drop databases, tables and a role, and temporarily move the extension between schemas.
 Tests require the current 0.1.0 files and all five functions loaded in the
 selected test database.
 The connection needs administrative privileges. No Python packages are required.
+Cache tests explicitly read sum() of a statistic before sampling (for example,
+sum(idx_blks_hit)); count(*) can be optimized to read only catalog identities
+and is not a valid way to prime the statistics cache.
+
+The session-timing test uses the standard `sleep` utility through psql's client-side
+`\!` command to leave a transaction idle before continuing.
 
 ```sh
 PGHOST=/path/to/socket PGPORT=5432 PGDATABASE=delta_test PGUSER=test_admin \

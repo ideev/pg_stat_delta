@@ -1,6 +1,7 @@
 """Integration tests against an isolated PostgreSQL database (standard PG* variables)."""
 import json
 import os
+from pathlib import Path
 import subprocess
 import time
 import unittest
@@ -20,6 +21,7 @@ class DeltaTests(unittest.TestCase):
         sql('CREATE EXTENSION IF NOT EXISTS pg_stat_delta')
 
     def sample(self, action, prefix='', function='pg_stat_database_delta', condition='TRUE'):
+        # Cache-priming prefixes must read a counter: count(*) can skip the getters.
         proc = subprocess.Popen(
             [PSQL, '-XAt', '-v', 'ON_ERROR_STOP=1', '-c', prefix +
              'SELECT coalesce(jsonb_agg(to_jsonb(d)),\'[]\'::jsonb) '
@@ -68,7 +70,7 @@ class DeltaTests(unittest.TestCase):
             rows = self.sample(
                 workload,
                 f"BEGIN; SET LOCAL stats_fetch_consistency='{mode}'; "
-                'SELECT count(*) FROM pg_stat_database; ')
+                'SELECT sum(xact_commit) FROM pg_stat_database; ')
             row = self.current(rows)
             self.assertEqual(row['status'], 'ok')
             self.assertGreaterEqual(row['xact_commit_delta'], 20)
@@ -80,6 +82,84 @@ class DeltaTests(unittest.TestCase):
         self.assertEqual(row['status'], 'reset')
         self.assertIsNone(row['xact_commit_delta'])
         self.assertIsNone(row['blks_read_delta'])
+
+    def test_session_counters(self):
+        def workload():
+            # A client-side pause leaves the backend idle in a transaction;
+            # server-side pg_sleep instead contributes active execution time.
+            subprocess.check_output(
+                [PSQL, '-XAt', '-v', 'ON_ERROR_STOP=1', '-c', 'BEGIN',
+                 '-c', r'\! sleep 0.08', '-c', 'SELECT pg_sleep(0.03)', '-c', 'COMMIT',
+                 '-c', 'SELECT pg_stat_force_next_flush()'], text=True)
+        row = self.current(self.sample(workload))
+        self.assertEqual(row['status'], 'ok')
+        for field in ['session_time_delta', 'active_time_delta', 'idle_in_transaction_time_delta']:
+            self.assertGreater(row[field], 0)
+        self.assertGreaterEqual(row['sessions_delta'], 1)
+        self.assertNotIn('stats_reset_start', row)
+        self.assertNotIn('stats_reset_end', row)
+
+    def test_alternative_join_plans(self):
+        for settings in [
+            'SET LOCAL enable_hashjoin=off; SET LOCAL join_collapse_limit=1; '
+            'SET LOCAL from_collapse_limit=1; ',
+            'SET LOCAL enable_mergejoin=off; SET LOCAL enable_nestloop=off; '
+            'SET LOCAL enable_material=off; ',
+        ]:
+            def workload():
+                args = [PSQL, '-XAt', '-v', 'ON_ERROR_STOP=1']
+                for _ in range(5):
+                    args.extend(['-c', 'SELECT 1'])
+                args.extend(['-c', 'SELECT pg_stat_force_next_flush()'])
+                subprocess.check_output(args, text=True)
+            row = self.current(self.sample(workload,
+                "BEGIN; SET LOCAL jit=off; SET LOCAL stats_fetch_consistency='snapshot'; "
+                + settings + 'SELECT sum(xact_commit) FROM pg_stat_database; '))
+            self.assertEqual(row['status'], 'ok')
+            self.assertGreaterEqual(row['xact_commit_delta'], 5)
+            self.assertGreaterEqual(row['elapsed_seconds'], 1.5)
+
+    def test_full_join_edge_cases(self):
+        # Exercise the actual query with controlled snapshots: membership changes
+        # cannot normally be induced through pg_database within one MVCC snapshot.
+        counters = ('xact_commit xact_rollback blks_read blks_hit tup_returned '
+                    'tup_fetched tup_inserted tup_updated tup_deleted temp_files '
+                    'temp_bytes deadlocks blk_read_time blk_write_time session_time '
+                    'active_time idle_in_transaction_time sessions').split()
+        columns = ['datid', 'datname', 'numbackends', 'stats_reset'] + counters
+        def fixture(rows):
+            values = []
+            for oid, name, backends, reset, amount in rows:
+                fields = [f'{oid}::oid', 'NULL::name' if name is None else f"'{name}'::name",
+                          f'{backends}::integer', f'{reset}::timestamptz']
+                fields += [f'{amount}::' + ('double precision' if c.endswith('_time') else 'bigint')
+                           for c in counters]
+                values.append('(' + ','.join(fields) + ')')
+            return 'FROM (VALUES ' + ','.join(values) + ') AS d(' + ','.join(columns) + ')'
+        before = [(0, None, 0, 'NULL', 10), (90001, 'both', 2, 'NULL', 10),
+                  (90002, 'gone', 2, 'NULL', 10),
+                  (90004, 'reset', 2, "'2026-01-01 UTC'", 10)]
+        after = [(0, None, 0, 'NULL', 15), (90001, 'both', 4, 'NULL', 20),
+                 (90003, 'new', 4, 'NULL', 20),
+                 (90004, 'reset', 4, "'2026-01-02 UTC'", 30)]
+        source = (Path(__file__).resolve().parents[1] / 'sql/pg_stat_database_delta.sql').read_text()
+        query = source.split('RETURN QUERY\n', 1)[1].split('\nEND;', 1)[0]
+        query = query.replace('FROM pg_stat_database AS d', fixture(before), 1)
+        query = query.replace('FROM pg_stat_database AS d', fixture(after), 1)
+        query = query.replace('i_delta_seconds::double precision', '0::double precision').rstrip().rstrip(';')
+        rows = json.loads(sql('SELECT jsonb_agg(to_jsonb(q)) FROM (' + query + ') q'))
+        by_id = {int(r['datid']): r for r in rows}
+        self.assertEqual(set(by_id), {0, 90001, 90002, 90003, 90004})
+        for oid in [90002, 90003, 90004]:
+            self.assertEqual(by_id[oid]['status'], 'reset' if oid == 90004 else 'missing')
+            for counter in counters:
+                self.assertIsNone(by_id[oid][counter+'_delta'])
+        self.assertEqual(by_id[0]['status'], 'ok')
+        self.assertIsNone(by_id[0]['datname'])
+        for counter in counters:
+            self.assertEqual(by_id[0][counter+'_delta'], 5)
+            self.assertEqual(by_id[90001][counter+'_delta'], 10)
+        self.assertEqual(by_id[90001]['num_backends_delta'], 2)
 
     def test_catalog_snapshot(self):
         name = 'delta_test_lifecycle'
@@ -163,7 +243,7 @@ class TableDeltaTests(unittest.TestCase):
                             f'WHERE id BETWEEN {base+95} AND {base+99}; '
                             'SELECT pg_stat_force_next_flush();'),
                 prefix=f"BEGIN; SET LOCAL stats_fetch_consistency='{mode}'; "
-                       'SELECT count(*) FROM pg_stat_user_tables; ')
+                       'SELECT sum(n_tup_ins) FROM pg_stat_user_tables; ')
             self.assertEqual(row['status'], 'ok')
             self.assertEqual(row['n_tup_ins_delta'], 100)
             self.assertEqual(row['n_tup_upd_delta'], 10)
@@ -185,10 +265,10 @@ class TableDeltaTests(unittest.TestCase):
             'SELECT pg_stat_force_next_flush();')
         row = self.table_sample(lambda: sql('ANALYZE delta_table_tests.heap'))
         self.assertEqual(row['status'], 'ok')
-        self.assertEqual(row['analyze_count_delta'], 1)
-        self.assertLess(row['n_mod_since_analyze_delta'], 0)
-        self.assertEqual(row['n_mod_since_analyze_end'], 0)
-        self.assertIsNotNone(row['last_analyze_end'])
+        self.assertEqual(row['n_mod_since_analyze'], 0)
+        self.assertGreaterEqual(row['n_live_tup'], 1)
+        self.assertIsNotNone(row['last_analyze'])
+        self.assertNotIn('analyze_count_delta', row)
 
     def test_table_reset(self):
         sql('INSERT INTO delta_table_tests.heap VALUES (90001,0); '
@@ -209,16 +289,17 @@ class TableDeltaTests(unittest.TestCase):
             'INSERT INTO delta_table_tests.reset_catchup SELECT generate_series(11,30); '
             'SELECT pg_stat_force_next_flush();'), table='reset_catchup')
         self.assertEqual(row['status'], 'reset')
-        self.assertNotEqual(row['database_stats_reset_start'], row['database_stats_reset_end'])
         self.assertIsNone(row['n_tup_ins_delta'])
-        self.assertGreater(row['n_live_tup_end'], row['n_live_tup_start'])
+        self.assertGreaterEqual(row['n_live_tup'], 20)
+        self.assertNotIn('database_stats_reset_start', row)
+        self.assertNotIn('n_live_tup_start', row)
 
     def test_dropped_table_statistics(self):
         sql('CREATE TABLE delta_table_tests.dropped(id integer); '
             'INSERT INTO delta_table_tests.dropped SELECT generate_series(1,10); '
             'SELECT pg_stat_force_next_flush();')
         row = self.table_sample(lambda: sql('DROP TABLE delta_table_tests.dropped'), table='dropped')
-        self.assertEqual(row['status'], 'counter_decreased')
+        self.assertEqual(row['status'], 'reset')
         self.assertIsNone(row['n_tup_ins_delta'])
 
     def test_database_reset(self):
@@ -239,6 +320,64 @@ class TableDeltaTests(unittest.TestCase):
                      'SELECT count(*)>0 FROM pg_stat_user_tables_delta(0); '
                      'SELECT count(*)>0 FROM pg_stat_user_tables_delta(0); COMMIT;')
         self.assertEqual(result.splitlines().count('t'), 2)
+
+    def test_alternative_join_plans(self):
+        for number, settings in enumerate([
+            'SET LOCAL enable_hashjoin=off; SET LOCAL join_collapse_limit=1; '
+            'SET LOCAL from_collapse_limit=1; ',
+            'SET LOCAL enable_mergejoin=off; SET LOCAL enable_nestloop=off; '
+            'SET LOCAL enable_material=off; ',
+        ]):
+            row = self.table_sample(lambda: sql(
+                f'INSERT INTO delta_table_tests.heap VALUES ({110000+number},0); '
+                'SELECT pg_stat_force_next_flush();'),
+                prefix="BEGIN; SET LOCAL jit=off; SET LOCAL stats_fetch_consistency='snapshot'; "
+                       + settings + 'SELECT sum(n_tup_ins) FROM pg_stat_user_tables; ')
+            self.assertEqual(row['status'], 'ok')
+            self.assertEqual(row['n_tup_ins_delta'], 1)
+
+    def test_full_join_edge_cases(self):
+        counters = ('seq_scan seq_tup_read idx_scan idx_tup_fetch n_tup_ins '
+                    'n_tup_upd n_tup_del n_tup_hot_upd n_tup_newpage_upd').split()
+        gauges = 'n_live_tup n_dead_tup n_mod_since_analyze n_ins_since_vacuum'.split()
+        times = 'last_vacuum last_autovacuum last_analyze last_autoanalyze'.split()
+        columns = ['relid', 'schemaname', 'relname'] + counters + gauges + times
+        def fixture(rows, day):
+            values = []
+            for oid, amount, gauge, inserted in rows:
+                fields = [f'{oid}::oid', "'fixture'::name", f"'t{oid}'::name"]
+                fields += ['NULL::bigint' if c.startswith('idx_') else
+                           f'{inserted if c == "n_tup_ins" else amount}::bigint' for c in counters]
+                fields += [f'{gauge}::bigint' for _ in gauges]
+                fields += [f"'2026-01-0{day} UTC'::timestamptz" for _ in times]
+                values.append('(' + ','.join(fields) + ')')
+            return 'FROM (VALUES ' + ','.join(values) + ') AS t(' + ','.join(columns) + ')'
+        before = [(90001,10,100,10), (90002,10,100,10),
+                  (90004,10,100,20), (90005,10,100,10)]
+        after = [(90001,20,200,20), (90003,20,200,20),
+                 (90004,20,200,10), (90005,10,0,10)]
+        source = (Path(__file__).resolve().parents[1] / 'sql/pg_stat_user_tables_delta.sql').read_text()
+        query = source.split('RETURN QUERY\n', 1)[1].split('\nEND;', 1)[0]
+        query = query.replace('FROM pg_stat_user_tables AS t', fixture(before, 1), 1)
+        query = query.replace('FROM pg_stat_user_tables AS t', fixture(after, 2), 1)
+        query = query.replace('i_delta_seconds::double precision', '0::double precision').rstrip().rstrip(';')
+        rows = json.loads(sql('SELECT jsonb_agg(to_jsonb(q)) FROM (' + query + ') q'))
+        by_id = {int(r['relid']): r for r in rows}
+        self.assertEqual(set(by_id), {90001, 90002, 90003, 90004, 90005})
+        for oid in [90002,90003,90004]:
+            self.assertEqual(by_id[oid]['status'], 'reset' if oid == 90004 else 'missing')
+            for c in counters:
+                self.assertIsNone(by_id[oid][c+'_delta'])
+        for oid in [90001,90005]:
+            self.assertEqual(by_id[oid]['status'], 'ok')
+            for c in counters:
+                expected = None if c.startswith('idx_') else (10 if oid == 90001 else 0)
+                self.assertEqual(by_id[oid][c+'_delta'], expected)
+        for g in gauges:
+            self.assertIsNone(by_id[90002][g])
+            self.assertEqual(by_id[90003][g], 200)
+            self.assertEqual(by_id[90005][g], 0)
+        self.assertTrue(by_id[90005]['last_analyze'].startswith('2026-01-02'))
 
     def test_catalog_snapshot(self):
         sql('CREATE TABLE delta_table_tests.before_rename(id integer)')
@@ -286,7 +425,7 @@ class IndexDeltaTests(unittest.TestCase):
             row = self.index_sample(
                 lambda: sql(settings + query + 'SELECT pg_stat_force_next_flush();'),
                 prefix=f"BEGIN; SET LOCAL stats_fetch_consistency='{mode}'; "
-                       'SELECT count(*) FROM pg_stat_user_indexes; ')
+                       'SELECT sum(idx_scan) FROM pg_stat_user_indexes; ')
             self.assertEqual(row['status'], 'ok')
             self.assertGreaterEqual(row['idx_scan_delta'], 1)
             # Planning can also read boundary index tuples for selectivity estimates.
@@ -302,7 +441,7 @@ class IndexDeltaTests(unittest.TestCase):
         row = self.index_sample(lambda: sql(settings + query + 'SELECT pg_stat_force_next_flush();'))
         self.assertEqual(row['status'], 'ok')
         self.assertGreaterEqual(row['idx_scan_delta'], 1)
-        # Physical reads can include the planner's boundary-value probes.
+        # Returned index entries can include the planner's boundary-value probes.
         self.assertGreaterEqual(row['idx_tup_read_delta'], 50)
         self.assertEqual(row['idx_tup_fetch_delta'], 0)
 
@@ -314,7 +453,7 @@ class IndexDeltaTests(unittest.TestCase):
         row = self.index_sample(lambda: sql(settings + query + 'SELECT pg_stat_force_next_flush();'))
         self.assertEqual(row['status'], 'ok')
         self.assertGreaterEqual(row['idx_scan_delta'], 1)
-        # Physical reads can include the planner's boundary-value probes.
+        # Returned index entries can include the planner's boundary-value probes.
         self.assertGreaterEqual(row['idx_tup_read_delta'], 50)
         self.assertEqual(row['idx_tup_fetch_delta'], 0)
 
@@ -345,10 +484,76 @@ class IndexDeltaTests(unittest.TestCase):
         for counter in ['idx_scan_delta', 'idx_tup_read_delta', 'idx_tup_fetch_delta']:
             self.assertIsNone(row[counter])
 
+    def test_reset_with_counters_catching_up(self):
+        settings = 'SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=off; '
+        query = 'SELECT sum(payload) FROM delta_index_tests.items WHERE id BETWEEN 1 AND 50; '
+        # Establish a known baseline, then exceed it after an explicit index reset.
+        sql("SELECT pg_stat_reset_single_table_counters('delta_index_tests.items_pkey'::regclass)")
+        sql(settings + query + 'SELECT pg_stat_force_next_flush();')
+        row = self.index_sample(lambda: sql(
+            "SELECT pg_stat_reset_single_table_counters('delta_index_tests.items_pkey'::regclass); "
+            + settings + query * 3 + 'SELECT pg_stat_force_next_flush();'))
+        self.assertEqual(row['status'], 'reset')
+        for field in ['idx_scan_delta', 'idx_tup_read_delta', 'idx_tup_fetch_delta']:
+            self.assertIsNone(row[field])
+
     def test_database_reset(self):
         row = self.index_sample(lambda: sql('SELECT pg_stat_reset()'))
         self.assertEqual(row['status'], 'reset')
         self.assertIsNone(row['idx_scan_delta'])
+
+    def test_alternative_join_plans(self):
+        for settings in [
+            'SET LOCAL enable_hashjoin=off; SET LOCAL join_collapse_limit=1; '
+            'SET LOCAL from_collapse_limit=1; ',
+            'SET LOCAL enable_mergejoin=off; SET LOCAL enable_nestloop=off; '
+            'SET LOCAL enable_material=off; ',
+        ]:
+            row = self.index_sample(lambda: sql(
+                'SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=off; '
+                'SELECT sum(payload) FROM delta_index_tests.items WHERE id BETWEEN 1 AND 50; '
+                'SELECT pg_stat_force_next_flush();'),
+                prefix="BEGIN; SET LOCAL jit=off; SET LOCAL stats_fetch_consistency='snapshot'; "
+                       + settings + 'SELECT sum(idx_scan) FROM pg_stat_user_indexes; ')
+            self.assertEqual(row['status'], 'ok')
+            self.assertGreaterEqual(row['idx_scan_delta'], 1)
+            self.assertGreaterEqual(row['idx_tup_read_delta'], 50)
+            self.assertEqual(row['idx_tup_fetch_delta'], 50)
+
+    def test_full_join_edge_cases(self):
+        counters = ['idx_scan', 'idx_tup_read', 'idx_tup_fetch']
+        columns = ['relid','indexrelid','schemaname','relname','indexrelname'] + counters + ['last_idx_scan']
+        def fixture(rows, day):
+            values = []
+            for oid, amounts in rows:
+                # Every index belongs to the same table: joining on relid is wrong.
+                fields = ['90000::oid',f'{oid}::oid',"'fixture'::name","'t'::name",f"'idx{oid}'::name"]
+                fields += [f'{n}::bigint' for n in amounts]
+                fields += [f"'2026-01-0{day} UTC'::timestamptz"]
+                values.append('(' + ','.join(fields) + ')')
+            return 'FROM (VALUES ' + ','.join(values) + ') AS i(' + ','.join(columns) + ')'
+        before = [(90101,(10,100,90)),(90102,(20,200,180)),(90103,(10,100,90))]
+        after = [(90101,(20,200,180)),(90102,(21,190,181)),(90104,(10,100,90))]
+        source = (Path(__file__).resolve().parents[1] / 'sql/pg_stat_user_indexes_delta.sql').read_text()
+        query = source.split('RETURN QUERY\n',1)[1].split('\nEND;',1)[0]
+        query = query.replace('FROM pg_stat_user_indexes AS i',fixture(before,1),1)
+        query = query.replace('FROM pg_stat_user_indexes AS i',fixture(after,2),1)
+        query = query.replace('i_delta_seconds::double precision','0::double precision').rstrip().rstrip(';')
+        rows = json.loads(sql('SELECT jsonb_agg(to_jsonb(q)) FROM (' + query + ') q'))
+        by_id = {int(r['indexrelid']):r for r in rows}
+        self.assertEqual(len(rows),4)
+        self.assertEqual(set(by_id),{90101,90102,90103,90104})
+        for oid in [90102,90103,90104]:
+            self.assertEqual(by_id[oid]['status'],'reset' if oid==90102 else 'missing')
+            for counter in counters:
+                self.assertIsNone(by_id[oid][counter+'_delta'])
+        self.assertEqual(by_id[90101]['status'],'ok')
+        self.assertEqual([by_id[90101][c+'_delta'] for c in counters],[10,100,90])
+        self.assertTrue(by_id[90101]['last_idx_scan_end'].startswith('2026-01-02'))
+        self.assertIsNone(by_id[90103]['last_idx_scan_end'])
+        self.assertTrue(by_id[90104]['last_idx_scan_end'].startswith('2026-01-02'))
+        self.assertNotIn('database_stats_reset_start',by_id[90101])
+        self.assertNotIn('database_stats_reset_end',by_id[90101])
 
     def test_catalog_snapshot(self):
         try:
@@ -374,7 +579,7 @@ class IndexDeltaTests(unittest.TestCase):
             'SELECT pg_stat_force_next_flush();')
         row = self.index_sample(lambda: sql('DROP INDEX delta_index_tests.dropped_idx'),
                                 index='dropped_idx')
-        self.assertEqual(row['status'], 'counter_decreased')
+        self.assertEqual(row['status'], 'reset')
         self.assertIsNone(row['idx_scan_delta'])
 
     def test_validation_and_repeated_calls(self):
@@ -428,7 +633,7 @@ class StatioDeltaTests(unittest.TestCase):
                 'SELECT sum(payload) FROM delta_statio_tests.heap; '
                 'SELECT pg_stat_force_next_flush();'),
                 prefix=f"BEGIN; SET LOCAL stats_fetch_consistency='{mode}'; "
-                       'SELECT count(*) FROM pg_statio_user_tables; ')
+                       'SELECT sum(heap_blks_hit) FROM pg_statio_user_tables; ')
             self.assertEqual(row['status'], 'ok')
             self.assertGreater(row['heap_blks_hit_delta'], 0)
             self.assertGreaterEqual(row['heap_blks_read_delta'], 0)
@@ -468,10 +673,84 @@ class StatioDeltaTests(unittest.TestCase):
         self.assertEqual(row['status'], 'reset')
         self.assertIsNone(row['idx_blks_hit_delta'])
 
+    def test_reset_with_io_counters_catching_up(self):
+        reset = "SELECT pg_stat_reset_single_table_counters('delta_statio_tests.indexed_pkey'::regclass); "
+        settings = 'SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=off; '
+        query = 'SELECT sum(payload) FROM delta_statio_tests.indexed WHERE id BETWEEN 1 AND 50; '
+        sql(reset)
+        sql(settings + query + 'SELECT pg_stat_force_next_flush();')
+        row = self.io_sample(lambda: sql(reset + settings + query * 5 +
+                             'SELECT pg_stat_force_next_flush();'), table='indexed')
+        self.assertEqual(row['status'], 'reset')
+        for counter in self.counters:
+            self.assertIsNone(row[counter+'_delta'])
+
     def test_database_reset(self):
         row = self.io_sample(lambda: sql('SELECT pg_stat_reset()'))
         self.assertEqual(row['status'], 'reset')
         self.assertIsNone(row['heap_blks_hit_delta'])
+
+    def test_alternative_join_plans(self):
+        for settings in [
+            'SET LOCAL enable_hashjoin=off; SET LOCAL join_collapse_limit=1; '
+            'SET LOCAL from_collapse_limit=1; ',
+            'SET LOCAL enable_mergejoin=off; SET LOCAL enable_nestloop=off; '
+            'SET LOCAL enable_material=off; ',
+        ]:
+            row = self.io_sample(lambda: sql(
+                'SELECT sum(payload) FROM delta_statio_tests.heap; '
+                'SELECT pg_stat_force_next_flush();'),
+                prefix="BEGIN; SET LOCAL jit=off; SET LOCAL stats_fetch_consistency='snapshot'; "
+                       + settings + 'SELECT sum(heap_blks_hit) FROM pg_statio_user_tables; ')
+            self.assertEqual(row['status'],'ok')
+            self.assertGreater(row['heap_blks_hit_delta'],0)
+
+    def test_full_join_edge_cases(self):
+        columns = ['relid','schemaname','relname'] + self.counters
+        def fixture(rows):
+            values=[]
+            for oid, amounts in rows:
+                fields=[f'{oid}::oid',"'fixture'::name",f"'t{oid}'::name"]
+                fields+=['NULL::bigint' if n is None else f'{n}::bigint' for n in amounts]
+                values.append('(' + ','.join(fields) + ')')
+            return 'FROM (VALUES ' + ','.join(values) + ') AS t(' + ','.join(columns) + ')'
+        before=[(90001,(5,100,None,None,None,None,None,None)),
+                (90002,(10,)*8),(90004,(0,)*8),
+                (90005,(5,100,0,200,0,0,0,0)),(90006,(10,)*8)]
+        after=[(90001,(5,110,None,None,None,None,None,None)),
+               (90003,(20,)*8),(90004,(0,)*8),
+               (90005,(5,110,0,190,0,0,0,0)),(90006,(20,)*8)]
+        source=(Path(__file__).resolve().parents[1] / 'sql/pg_statio_user_tables_delta.sql').read_text()
+        query=source.split('RETURN QUERY\n',1)[1].split('\nEND;',1)[0]
+        query=query.replace('FROM pg_statio_user_tables AS t',fixture(before),1)
+        query=query.replace('FROM pg_statio_user_tables AS t',fixture(after),1)
+        query=query.replace('i_delta_seconds::double precision','0::double precision').rstrip().rstrip(';')
+        marker='pg_stat_get_db_stat_reset_time((SELECT id FROM database_id))'
+        def run(reset):
+            q=query.replace(marker,"'2026-01-01 UTC'::timestamptz",1)
+            q=q.replace(marker,f"'2026-01-0{2 if reset else 1} UTC'::timestamptz",1)
+            rows=json.loads(sql('SELECT jsonb_agg(to_jsonb(q)) FROM (' + q + ') q'))
+            return {int(r['relid']):r for r in rows}
+        rows=run(False)
+        self.assertEqual(set(rows),{90001,90002,90003,90004,90005,90006})
+        for oid,status in [(90002,'missing'),(90003,'missing'),(90005,'counter_decreased')]:
+            self.assertEqual(rows[oid]['status'],status)
+            for c in self.counters:
+                self.assertIsNone(rows[oid][c+'_delta'])
+        for oid in [90001,90004,90006]:
+            self.assertEqual(rows[oid]['status'],'ok')
+        self.assertEqual([rows[90001][c+'_delta'] for c in self.counters],
+                         [0,10,None,None,None,None,None,None])
+        self.assertEqual([rows[90004][c+'_delta'] for c in self.counters],[0]*8)
+        self.assertEqual([rows[90006][c+'_delta'] for c in self.counters],[10]*8)
+        # Reset markers invalidate even unchanged zero counters and caught-up values.
+        reset_rows=run(True)
+        for oid,row in reset_rows.items():
+            self.assertEqual(row['status'],'missing' if oid in [90002,90003] else 'reset')
+            for c in self.counters:
+                self.assertIsNone(row[c+'_delta'])
+        self.assertNotIn('database_stats_reset_start',rows[90001])
+        self.assertNotIn('database_stats_reset_end',rows[90001])
 
     def test_catalog_snapshot_and_drop(self):
         sql('CREATE TABLE delta_statio_tests.before_rename(id integer) '
@@ -543,7 +822,7 @@ class IndexIODeltaTests(unittest.TestCase):
                 'SELECT sum(payload) FROM delta_index_io_tests.items WHERE id BETWEEN 1 AND 50; '
                 'SELECT pg_stat_force_next_flush();'),
                 prefix=f"BEGIN; SET LOCAL stats_fetch_consistency='{mode}'; "
-                       'SELECT count(*) FROM pg_statio_user_indexes; ')
+                       'SELECT sum(idx_blks_hit) FROM pg_statio_user_indexes; ')
             self.assertEqual(row['status'], 'ok')
             self.assertGreater(row['idx_blks_hit_delta'], 0)
             self.assertGreaterEqual(row['idx_blks_read_delta'], 0)
@@ -576,6 +855,76 @@ class IndexIODeltaTests(unittest.TestCase):
         self.assertEqual(row['status'], 'reset')
         self.assertIsNone(row['idx_blks_read_delta'])
         self.assertIsNone(row['idx_blks_hit_delta'])
+
+    def test_reset_with_io_counters_catching_up(self):
+        reset = "SELECT pg_stat_reset_single_table_counters('delta_index_io_tests.items_pkey'::regclass); "
+        settings = 'SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=off; '
+        query = 'SELECT sum(payload) FROM delta_index_io_tests.items WHERE id BETWEEN 1 AND 50; '
+        sql(reset)
+        sql(settings + query + 'SELECT pg_stat_force_next_flush();')
+        row = self.io_sample(lambda: sql(reset + settings + query * 5 +
+                             'SELECT pg_stat_force_next_flush();'))
+        self.assertEqual(row['status'],'reset')
+        self.assertIsNone(row['idx_blks_read_delta'])
+        self.assertIsNone(row['idx_blks_hit_delta'])
+
+    def test_alternative_join_plans(self):
+        for settings in [
+            'SET LOCAL enable_hashjoin=off; SET LOCAL join_collapse_limit=1; '
+            'SET LOCAL from_collapse_limit=1; ',
+            'SET LOCAL enable_mergejoin=off; SET LOCAL enable_nestloop=off; '
+            'SET LOCAL enable_material=off; ',
+        ]:
+            row = self.io_sample(lambda: sql(
+                'SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=off; '
+                'SELECT sum(payload) FROM delta_index_io_tests.items WHERE id BETWEEN 1 AND 50; '
+                'SELECT pg_stat_force_next_flush();'),
+                prefix="BEGIN; SET LOCAL jit=off; SET LOCAL stats_fetch_consistency='snapshot'; "
+                       + settings + 'SELECT sum(idx_blks_hit) FROM pg_statio_user_indexes; ')
+            self.assertEqual(row['status'],'ok')
+            self.assertGreater(row['idx_blks_hit_delta'],0)
+
+    def test_full_join_edge_cases(self):
+        columns=['relid','indexrelid','schemaname','relname','indexrelname','idx_blks_read','idx_blks_hit']
+        def fixture(rows):
+            values=[]
+            for oid,read,hit in rows:
+                fields=['90000::oid',f'{oid}::oid',"'fixture'::name","'t'::name",f"'idx{oid}'::name",
+                        f'{read}::bigint',f'{hit}::bigint']
+                values.append('(' + ','.join(fields) + ')')
+            return 'FROM (VALUES ' + ','.join(values) + ') AS i(' + ','.join(columns) + ')'
+        before=[(90101,5,100),(90102,10,200),(90103,10,100),(90105,0,0)]
+        after=[(90101,5,110),(90102,20,190),(90104,20,200),(90105,0,0)]
+        source=(Path(__file__).resolve().parents[1] / 'sql/pg_statio_user_indexes_delta.sql').read_text()
+        query=source.split('RETURN QUERY\n',1)[1].split('\nEND;',1)[0]
+        query=query.replace('FROM pg_statio_user_indexes AS i',fixture(before),1)
+        query=query.replace('FROM pg_statio_user_indexes AS i',fixture(after),1)
+        query=query.replace('i_delta_seconds::double precision','0::double precision').rstrip().rstrip(';')
+        marker='pg_stat_get_db_stat_reset_time((SELECT id FROM database_id))'
+        def run(reset):
+            q=query.replace(marker,"'2026-01-01 UTC'::timestamptz",1)
+            q=q.replace(marker,f"'2026-01-0{2 if reset else 1} UTC'::timestamptz",1)
+            rows=json.loads(sql('SELECT jsonb_agg(to_jsonb(q)) FROM (' + q + ') q'))
+            self.assertEqual(len(rows),5)
+            return {int(r['indexrelid']):r for r in rows}
+        rows=run(False)
+        self.assertEqual(set(rows),{90101,90102,90103,90104,90105})
+        for oid,status in [(90102,'counter_decreased'),(90103,'missing'),(90104,'missing')]:
+            self.assertEqual(rows[oid]['status'],status)
+            self.assertIsNone(rows[oid]['idx_blks_read_delta'])
+            self.assertIsNone(rows[oid]['idx_blks_hit_delta'])
+        self.assertEqual(rows[90101]['status'],'ok')
+        self.assertEqual(rows[90101]['idx_blks_read_delta'],0)
+        self.assertEqual(rows[90101]['idx_blks_hit_delta'],10)
+        self.assertEqual(rows[90105]['status'],'ok')
+        self.assertEqual(rows[90105]['idx_blks_read_delta'],0)
+        self.assertEqual(rows[90105]['idx_blks_hit_delta'],0)
+        for oid,row in run(True).items():
+            self.assertEqual(row['status'],'missing' if oid in [90103,90104] else 'reset')
+            self.assertIsNone(row['idx_blks_read_delta'])
+            self.assertIsNone(row['idx_blks_hit_delta'])
+        self.assertNotIn('database_stats_reset_start',rows[90101])
+        self.assertNotIn('database_stats_reset_end',rows[90101])
 
     def test_database_reset(self):
         row = self.io_sample(lambda: sql('SELECT pg_stat_reset()'))

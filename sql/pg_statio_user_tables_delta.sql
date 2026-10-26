@@ -1,4 +1,4 @@
--- Samples user tables, including their index and TOAST block counters.
+-- Flat block-I/O snapshots; part of extension version 0.1.0.
 CREATE FUNCTION pg_statio_user_tables_delta(i_delta_seconds numeric DEFAULT 5)
 RETURNS TABLE (
     relid oid,
@@ -8,8 +8,6 @@ RETURNS TABLE (
     sampled_at_end timestamptz,
     elapsed_seconds double precision,
     status text,
-    database_stats_reset_start timestamptz,
-    database_stats_reset_end timestamptz,
     heap_blks_read_delta bigint,
     heap_blks_hit_delta bigint,
     idx_blks_read_delta bigint,
@@ -35,8 +33,9 @@ BEGIN
     ), initial_clear AS MATERIALIZED (
         SELECT pg_stat_clear_snapshot()
     ), first_snapshot AS MATERIALIZED (
-        SELECT t AS r FROM pg_statio_user_tables AS t
-        -- The singleton clear CTE makes this OFFSET zero, after cache clearing.
+        SELECT t.* FROM pg_statio_user_tables AS t
+        -- This view aggregates indexes; initialize its zero OFFSET and consume
+        -- cache clearing before entering the source aggregate.
         OFFSET (SELECT count(*) - 1 FROM initial_clear)
     ), first_time AS MATERIALIZED (
         -- Consume every relation before sleeping, including an empty snapshot.
@@ -51,61 +50,61 @@ BEGIN
         -- Reading waited performs the sleep before clearing the cached statistics.
         SELECT pg_stat_clear_snapshot() FROM waited
     ), second_snapshot AS MATERIALIZED (
-        SELECT t AS r FROM pg_statio_user_tables AS t
-        -- Evaluate the sleep/clear dependency before scanning statistics again.
+        SELECT t.* FROM pg_statio_user_tables AS t
+        -- Complete sleep and clearing before entering the aggregate source view.
         OFFSET (SELECT count(*) - 1 FROM second_clear)
     ), second_time AS MATERIALIZED (
         SELECT clock_timestamp() AS finished_at, count(*) AS n,
                pg_stat_get_db_stat_reset_time((SELECT id FROM database_id)) AS reset_at
         FROM second_snapshot
-    ), snapshots AS (
-        SELECT 1 AS snap, r FROM first_snapshot
-        UNION ALL
-        SELECT 2 AS snap, r FROM second_snapshot
-    ), windowed AS (
-        SELECT snap, r,
-               lag(r) OVER (PARTITION BY (r).relid ORDER BY snap) AS previous_row
-        FROM snapshots
-    ), paired AS (
-        SELECT previous_row AS before_row, r AS after_row
-        FROM windowed WHERE snap = 2
     ), measured AS (
-        SELECT p.*, a.started_at, b.finished_at,
-               a.reset_at AS reset_start, b.reset_at AS reset_end,
-               CASE WHEN a.reset_at IS DISTINCT FROM b.reset_at THEN 'reset'
-                    WHEN (after_row).heap_blks_read < (before_row).heap_blks_read
-                      OR (after_row).heap_blks_hit < (before_row).heap_blks_hit
-                      OR (after_row).idx_blks_read < (before_row).idx_blks_read
-                      OR (after_row).idx_blks_hit < (before_row).idx_blks_hit
-                      OR (after_row).toast_blks_read < (before_row).toast_blks_read
-                      OR (after_row).toast_blks_hit < (before_row).toast_blks_hit
-                      OR (after_row).tidx_blks_read < (before_row).tidx_blks_read
-                      OR (after_row).tidx_blks_hit < (before_row).tidx_blks_hit THEN 'counter_decreased'
-                    ELSE 'ok' END AS sample_status
-        FROM paired AS p CROSS JOIN first_time AS a CROSS JOIN second_time AS b
-        -- Compute reset classification once per row, not once per output counter.
+        SELECT coalesce(s2.relid, s1.relid) AS relid,
+               coalesce(s2.schemaname, s1.schemaname) AS schemaname,
+               coalesce(s2.relname, s1.relname) AS relname,
+               t1.started_at AS sampled_at_start,
+               t2.finished_at AS sampled_at_end,
+               extract(epoch FROM t2.finished_at - t1.started_at)::double precision AS elapsed_seconds,
+               CASE WHEN s1.relid IS NULL OR s2.relid IS NULL THEN 'missing'
+                    WHEN t1.reset_at IS DISTINCT FROM t2.reset_at THEN 'reset'
+                    WHEN s2.heap_blks_read < s1.heap_blks_read
+                      OR s2.heap_blks_hit < s1.heap_blks_hit
+                      OR s2.idx_blks_read < s1.idx_blks_read
+                      OR s2.idx_blks_hit < s1.idx_blks_hit
+                      OR s2.toast_blks_read < s1.toast_blks_read
+                      OR s2.toast_blks_hit < s1.toast_blks_hit
+                      OR s2.tidx_blks_read < s1.tidx_blks_read
+                      OR s2.tidx_blks_hit < s1.tidx_blks_hit THEN 'counter_decreased'
+                    ELSE 'ok' END AS status,
+               s2.heap_blks_read - s1.heap_blks_read AS heap_blks_read_delta,
+               s2.heap_blks_hit - s1.heap_blks_hit AS heap_blks_hit_delta,
+               s2.idx_blks_read - s1.idx_blks_read AS idx_blks_read_delta,
+               s2.idx_blks_hit - s1.idx_blks_hit AS idx_blks_hit_delta,
+               s2.toast_blks_read - s1.toast_blks_read AS toast_blks_read_delta,
+               s2.toast_blks_hit - s1.toast_blks_hit AS toast_blks_hit_delta,
+               s2.tidx_blks_read - s1.tidx_blks_read AS tidx_blks_read_delta,
+               s2.tidx_blks_hit - s1.tidx_blks_hit AS tidx_blks_hit_delta
+        FROM first_snapshot AS s1
+        FULL OUTER JOIN second_snapshot AS s2 ON s1.relid = s2.relid
+        CROSS JOIN first_time AS t1
+        CROSS JOIN second_time AS t2
+        -- Compute the eight-counter validity test once per row rather than once
+        -- for every output delta, without another materialized snapshot.
         OFFSET 0
     )
-    SELECT (after_row).relid AS relid,
-           (after_row).schemaname AS schemaname,
-           (after_row).relname AS relname,
-           started_at AS sampled_at_start,
-           finished_at AS sampled_at_end,
-           extract(epoch FROM finished_at - started_at)::double precision AS elapsed_seconds,
-           sample_status AS status,
-           reset_start AS database_stats_reset_start,
-           reset_end AS database_stats_reset_end,
-           CASE WHEN sample_status = 'ok' THEN (after_row).heap_blks_read - (before_row).heap_blks_read END AS heap_blks_read_delta,
-           CASE WHEN sample_status = 'ok' THEN (after_row).heap_blks_hit - (before_row).heap_blks_hit END AS heap_blks_hit_delta,
-           CASE WHEN sample_status = 'ok' THEN (after_row).idx_blks_read - (before_row).idx_blks_read END AS idx_blks_read_delta,
-           CASE WHEN sample_status = 'ok' THEN (after_row).idx_blks_hit - (before_row).idx_blks_hit END AS idx_blks_hit_delta,
-           CASE WHEN sample_status = 'ok' THEN (after_row).toast_blks_read - (before_row).toast_blks_read END AS toast_blks_read_delta,
-           CASE WHEN sample_status = 'ok' THEN (after_row).toast_blks_hit - (before_row).toast_blks_hit END AS toast_blks_hit_delta,
-           CASE WHEN sample_status = 'ok' THEN (after_row).tidx_blks_read - (before_row).tidx_blks_read END AS tidx_blks_read_delta,
-           CASE WHEN sample_status = 'ok' THEN (after_row).tidx_blks_hit - (before_row).tidx_blks_hit END AS tidx_blks_hit_delta
-    FROM measured;
+    SELECT m.relid, m.schemaname, m.relname,
+           m.sampled_at_start, m.sampled_at_end, m.elapsed_seconds, m.status,
+           CASE WHEN m.status = 'ok' THEN m.heap_blks_read_delta END AS heap_blks_read_delta,
+           CASE WHEN m.status = 'ok' THEN m.heap_blks_hit_delta END AS heap_blks_hit_delta,
+           CASE WHEN m.status = 'ok' THEN m.idx_blks_read_delta END AS idx_blks_read_delta,
+           CASE WHEN m.status = 'ok' THEN m.idx_blks_hit_delta END AS idx_blks_hit_delta,
+           CASE WHEN m.status = 'ok' THEN m.toast_blks_read_delta END AS toast_blks_read_delta,
+           CASE WHEN m.status = 'ok' THEN m.toast_blks_hit_delta END AS toast_blks_hit_delta,
+           CASE WHEN m.status = 'ok' THEN m.tidx_blks_read_delta END AS tidx_blks_read_delta,
+           CASE WHEN m.status = 'ok' THEN m.tidx_blks_hit_delta END AS tidx_blks_hit_delta
+    FROM measured AS m
+    ORDER BY m.schemaname, m.relname;
 END;
 $$;
 
 COMMENT ON FUNCTION pg_statio_user_tables_delta(numeric) IS
-'Published user-table block-read and buffer-cache-hit deltas, including their indexes and TOAST. Not physical device I/O; resets and decreasing counters invalidate deltas.';
+'Published user-table block I/O deltas. Missing rows, database reset markers or decreasing counters invalidate all eight deltas; reads are not necessarily device I/O.';
