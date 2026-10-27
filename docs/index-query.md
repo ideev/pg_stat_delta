@@ -32,18 +32,14 @@ second row yields NULL; a missing first row can still have a last-scan timestamp
 
 The first snapshot selects identity fields and three counters, without the
 last-scan timestamp; the second includes that timestamp too. All fields are
-native scalar types. A flat measured subquery computes the reset classification
-once per row. OFFSET 0 prevents it being expanded into each output CASE without
-creating another materialized snapshot. There is no WindowAgg or composite row.
+native scalar types. A flat measured CTE names the status and raw start/end
+counter values. Every subtraction occurs inside its status-ok CASE. No single
+status evaluation is promised by an ordinary CTE; no OFFSET 0 is retained.
 
-EXPLAIN VERBOSE on PostgreSQL 17.11 showed the statistics getters only in the root
-Nested Loop projection of each snapshot. The clear CTE is among its relational
-inputs (possibly nested within joins). Thus the verified plans consume the clear
-row before projecting the getters. This source view has no index aggregation
-like the table-statistics view; the table sampler's explicit pre-scan OFFSET
-barrier is not copied mechanically. CROSS JOIN textual order is not a general
-SQL side-effect-order guarantee; plans and concurrent tests must be rechecked
-when changing the source/query shape or PostgreSQL version.
+Both snapshots now use explicit zero OFFSET InitPlans consuming their clear CTE
+before source scanning. This uniform rule replaces dependence on the earlier
+verified flat-projection CROSS JOIN plans. See [current policy](uniform-snapshots.md).
+The performance comparison below records the earlier implementation.
 
 Timing aggregates consume entire snapshots and return one timing row, including
 an empty index set. The second clear depends on sleep. FULL OUTER JOIN uses

@@ -95,15 +95,15 @@ BEGIN
                       OR s2.n_tup_hot_upd < s1.n_tup_hot_upd
                       OR s2.n_tup_newpage_upd < s1.n_tup_newpage_upd THEN 'reset'
                     ELSE 'ok' END AS status,
-               s2.seq_scan - s1.seq_scan AS seq_scan_delta,
-               s2.seq_tup_read - s1.seq_tup_read AS seq_tup_read_delta,
-               s2.idx_scan - s1.idx_scan AS idx_scan_delta,
-               s2.idx_tup_fetch - s1.idx_tup_fetch AS idx_tup_fetch_delta,
-               s2.n_tup_ins - s1.n_tup_ins AS n_tup_ins_delta,
-               s2.n_tup_upd - s1.n_tup_upd AS n_tup_upd_delta,
-               s2.n_tup_del - s1.n_tup_del AS n_tup_del_delta,
-               s2.n_tup_hot_upd - s1.n_tup_hot_upd AS n_tup_hot_upd_delta,
-               s2.n_tup_newpage_upd - s1.n_tup_newpage_upd AS n_tup_newpage_upd_delta,
+               s1.seq_scan AS seq_scan_start, s2.seq_scan AS seq_scan_end,
+               s1.seq_tup_read AS seq_tup_read_start, s2.seq_tup_read AS seq_tup_read_end,
+               s1.idx_scan AS idx_scan_start, s2.idx_scan AS idx_scan_end,
+               s1.idx_tup_fetch AS idx_tup_fetch_start, s2.idx_tup_fetch AS idx_tup_fetch_end,
+               s1.n_tup_ins AS n_tup_ins_start, s2.n_tup_ins AS n_tup_ins_end,
+               s1.n_tup_upd AS n_tup_upd_start, s2.n_tup_upd AS n_tup_upd_end,
+               s1.n_tup_del AS n_tup_del_start, s2.n_tup_del AS n_tup_del_end,
+               s1.n_tup_hot_upd AS n_tup_hot_upd_start, s2.n_tup_hot_upd AS n_tup_hot_upd_end,
+               s1.n_tup_newpage_upd AS n_tup_newpage_upd_start, s2.n_tup_newpage_upd AS n_tup_newpage_upd_end,
                s2.n_live_tup AS n_live_tup,
                s2.n_dead_tup AS n_dead_tup,
                s2.n_mod_since_analyze AS n_mod_since_analyze,
@@ -116,21 +116,18 @@ BEGIN
         FULL OUTER JOIN second_snapshot AS s2 ON s1.relid = s2.relid
         CROSS JOIN first_time AS t1
         CROSS JOIN second_time AS t2
-        -- Keep reset classification once per row, without materializing another
-        -- snapshot or repeating the nine-counter check for every output delta.
-        OFFSET 0
     )
     SELECT m.relid, m.schemaname, m.relname,
            m.sampled_at_start, m.sampled_at_end, m.elapsed_seconds, m.status,
-           CASE WHEN m.status = 'ok' THEN m.seq_scan_delta END AS seq_scan_delta,
-           CASE WHEN m.status = 'ok' THEN m.seq_tup_read_delta END AS seq_tup_read_delta,
-           CASE WHEN m.status = 'ok' THEN m.idx_scan_delta END AS idx_scan_delta,
-           CASE WHEN m.status = 'ok' THEN m.idx_tup_fetch_delta END AS idx_tup_fetch_delta,
-           CASE WHEN m.status = 'ok' THEN m.n_tup_ins_delta END AS n_tup_ins_delta,
-           CASE WHEN m.status = 'ok' THEN m.n_tup_upd_delta END AS n_tup_upd_delta,
-           CASE WHEN m.status = 'ok' THEN m.n_tup_del_delta END AS n_tup_del_delta,
-           CASE WHEN m.status = 'ok' THEN m.n_tup_hot_upd_delta END AS n_tup_hot_upd_delta,
-           CASE WHEN m.status = 'ok' THEN m.n_tup_newpage_upd_delta END AS n_tup_newpage_upd_delta,
+           CASE WHEN m.status = 'ok' THEN m.seq_scan_end - m.seq_scan_start END AS seq_scan_delta,
+           CASE WHEN m.status = 'ok' THEN m.seq_tup_read_end - m.seq_tup_read_start END AS seq_tup_read_delta,
+           CASE WHEN m.status = 'ok' THEN m.idx_scan_end - m.idx_scan_start END AS idx_scan_delta,
+           CASE WHEN m.status = 'ok' THEN m.idx_tup_fetch_end - m.idx_tup_fetch_start END AS idx_tup_fetch_delta,
+           CASE WHEN m.status = 'ok' THEN m.n_tup_ins_end - m.n_tup_ins_start END AS n_tup_ins_delta,
+           CASE WHEN m.status = 'ok' THEN m.n_tup_upd_end - m.n_tup_upd_start END AS n_tup_upd_delta,
+           CASE WHEN m.status = 'ok' THEN m.n_tup_del_end - m.n_tup_del_start END AS n_tup_del_delta,
+           CASE WHEN m.status = 'ok' THEN m.n_tup_hot_upd_end - m.n_tup_hot_upd_start END AS n_tup_hot_upd_delta,
+           CASE WHEN m.status = 'ok' THEN m.n_tup_newpage_upd_end - m.n_tup_newpage_upd_start END AS n_tup_newpage_upd_delta,
            m.n_live_tup AS n_live_tup,
            m.n_dead_tup AS n_dead_tup,
            m.n_mod_since_analyze AS n_mod_since_analyze,

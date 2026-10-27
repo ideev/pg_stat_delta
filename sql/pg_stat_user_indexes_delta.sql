@@ -31,11 +31,11 @@ BEGIN
     ), initial_clear AS MATERIALIZED (
         SELECT pg_stat_clear_snapshot()
     ), first_snapshot AS MATERIALIZED (
-        -- Flat projection keeps getters above the clear join in verified PG17 plans.
         SELECT i.relid, i.indexrelid, i.schemaname, i.relname, i.indexrelname,
                i.idx_scan, i.idx_tup_read, i.idx_tup_fetch
         FROM pg_stat_user_indexes AS i
-        CROSS JOIN initial_clear
+        -- Initialize the zero OFFSET before the scan to clear cached statistics.
+        OFFSET (SELECT count(*) - 1 FROM initial_clear)
     ), first_time AS MATERIALIZED (
         -- Consume the whole snapshot before waiting, including an empty snapshot.
         SELECT clock_timestamp() AS started_at, count(*) AS n,
@@ -47,11 +47,11 @@ BEGIN
         -- The sleep is consumed before statistics are cleared for the second read.
         SELECT pg_stat_clear_snapshot() FROM waited
     ), second_snapshot AS MATERIALIZED (
-        -- Consume the sleep/clear row before projecting second-snapshot statistics.
         SELECT i.relid, i.indexrelid, i.schemaname, i.relname, i.indexrelname,
                i.idx_scan, i.idx_tup_read, i.idx_tup_fetch, i.last_idx_scan
         FROM pg_stat_user_indexes AS i
-        CROSS JOIN second_clear
+        -- Initialize the zero OFFSET before the scan to clear cached statistics.
+        OFFSET (SELECT count(*) - 1 FROM second_clear)
     ), second_time AS MATERIALIZED (
         SELECT clock_timestamp() AS finished_at, count(*) AS n,
                pg_stat_get_db_stat_reset_time((SELECT id FROM database_id)) AS reset_at
@@ -73,23 +73,20 @@ BEGIN
                       OR s2.idx_tup_read < s1.idx_tup_read
                       OR s2.idx_tup_fetch < s1.idx_tup_fetch THEN 'reset'
                     ELSE 'ok' END AS status,
-               s2.idx_scan - s1.idx_scan AS idx_scan_delta,
-               s2.idx_tup_read - s1.idx_tup_read AS idx_tup_read_delta,
-               s2.idx_tup_fetch - s1.idx_tup_fetch AS idx_tup_fetch_delta,
+               s1.idx_scan AS idx_scan_start, s2.idx_scan AS idx_scan_end,
+               s1.idx_tup_read AS idx_tup_read_start, s2.idx_tup_read AS idx_tup_read_end,
+               s1.idx_tup_fetch AS idx_tup_fetch_start, s2.idx_tup_fetch AS idx_tup_fetch_end,
                s2.last_idx_scan AS last_idx_scan_end
         FROM first_snapshot AS s1
         FULL OUTER JOIN second_snapshot AS s2 ON s1.indexrelid = s2.indexrelid
         CROSS JOIN first_time AS t1
         CROSS JOIN second_time AS t2
-        -- Avoid repeating the three-counter reset classification for every delta,
-        -- without materializing another snapshot.
-        OFFSET 0
     )
     SELECT m.relid, m.indexrelid, m.schemaname, m.relname, m.indexrelname,
            m.sampled_at_start, m.sampled_at_end, m.elapsed_seconds, m.status,
-           CASE WHEN m.status = 'ok' THEN m.idx_scan_delta END AS idx_scan_delta,
-           CASE WHEN m.status = 'ok' THEN m.idx_tup_read_delta END AS idx_tup_read_delta,
-           CASE WHEN m.status = 'ok' THEN m.idx_tup_fetch_delta END AS idx_tup_fetch_delta,
+           CASE WHEN m.status = 'ok' THEN m.idx_scan_end - m.idx_scan_start END AS idx_scan_delta,
+           CASE WHEN m.status = 'ok' THEN m.idx_tup_read_end - m.idx_tup_read_start END AS idx_tup_read_delta,
+           CASE WHEN m.status = 'ok' THEN m.idx_tup_fetch_end - m.idx_tup_fetch_start END AS idx_tup_fetch_delta,
            m.last_idx_scan_end
     FROM measured AS m
     ORDER BY m.schemaname, m.relname, m.indexrelname;

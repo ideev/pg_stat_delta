@@ -36,34 +36,41 @@ view can be reduced to a catalog-only plan and does not establish cached stats.
 
 ## Statistics query baselines
 
-The current pg_stat_database_delta baseline uses flat materialized snapshots
-and FULL OUTER JOIN. Compare future changes against this implementation and
-measure actual execution, not just planner cost. Preserve the verified placement
-of cache clearing before statistics getter evaluation; recheck plans and
-concurrent cache-mode tests when changing this query shape or PostgreSQL version.
-See docs/database-query.md for the analysis and measurements.
+All six samplers use the same pre-scan cache-clear dependency in both
+first_snapshot and second_snapshot:
 
-The table sampler also uses flat snapshots and FULL OUTER JOIN, with explicit
-cache-clear OFFSET dependencies because its source view contains aggregates.
-Retain database reset-marker validation and whole-row invalidation of all nine
-cumulative deltas. Scan-counter decreases alone do not detect every reset.
-See docs/table-query.md for the tested compact API and performance comparison.
+```sql
+OFFSET (SELECT count(*) - 1 FROM initial_clear)
+-- Use second_clear for the second snapshot.
+```
 
-The index sampler now also uses flat snapshots and FULL OUTER JOIN. Keep its
-internal database reset-marker check and invalidate all three cumulative deltas
-for missing/reset rows, including resets whose counters caught up. The marker
-is not part of its compact public result. See docs/index-query.md.
+Each clear CTE returns one row, so the offset is zero. Its InitPlan consumes
+clearing (and, on the second read, the preceding wait) before starting the scan.
+Retain this dependency for every source view, even where a particular flat
+CROSS JOIN plan happened to project getters after clearing. Recheck actual plans
+and concurrent tests on PostgreSQL/query changes.
 
-The table block-I/O sampler also uses flat snapshots and FULL OUTER JOIN.
-Retain its pre-scan cache-clear dependency for the aggregate source view. Its
-reset marker is internal; all eight deltas must be NULL for reset,
-counter_decreased or missing, even if individual counters are nondecreasing.
-See docs/table-io-query.md for the regression and comparison.
+Calculate every public *_delta only inside CASE WHEN status = 'ok' THEN
+end_value - start_value END. Keep raw start/end values until this final CASE:
+invalid rows must not perform subtraction, which can overflow bigint even when
+the result would later be discarded. This includes num_backends_delta; its
+start/end gauges remain available on invalid rows. Do not claim that ordinary
+CTEs or OFFSET 0 guarantee a single status evaluation: verify actual plans.
+Avoid extra per-object materialization solely to share a cheap status check.
 
-The index block-I/O sampler completes the flat-snapshot/FULL OUTER JOIN baseline
-for all five functions. Keep its database reset marker internal and return both
-block-counter deltas as NULL for every non-ok status. Verify cache ordering and
-independence of indexes sharing one relid. See docs/index-io-query.md.
+The five object samplers use flat snapshots and FULL OUTER JOIN by object OID.
+The database sampler compares source stats_reset. The four relation samplers
+read the database reset marker internally once per snapshot. A marker change
+invalidates all deltas, even if activity has already caught up. Table/index
+statistics classify decreases as reset; block-I/O samplers use counter_decreased.
+All invalid statuses, including missing, invalidate every delta together.
+
+The WAL sampler reads one cluster-wide row from pg_stat_wal. Keep wal_bytes in
+native numeric and use the source reset marker. Any decrease or reset invalidates
+all eight deltas. No identity join or sort is needed.
+
+See docs/uniform-snapshots.md for the current query policy and measurements.
+The per-function query documents retain earlier implementation comparisons.
 
 ## Query clarity
 

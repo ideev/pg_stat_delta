@@ -13,19 +13,17 @@ revision is described in table-query.md. All functions remain version 0.1.0.
 - Both cache-clear CTEs are joined to their reads. first_time and second_time
   retain aggregates, which consume the snapshots and yield a single timing row.
 - The reset condition is a direct comparison of stats_reset. Equal NULL markers
-  are accepted. Missing-side subtraction produces NULL, even when both reset
-  markers are NULL.
+  are accepted. The missing status prevents subtraction, even when both reset markers are NULL.
 
 ## Execution-order checks
 
-CROSS JOIN text order alone is not a general SQL guarantee of side-effect order.
-For this flat pg_stat_database query, EXPLAIN VERBOSE on PostgreSQL 17.11 shows
-statistics getters in each snapshot's Nested Loop projection, above its input
-scans. The clear CTE is the first child in the default plan; the other child is
-an Append of database identities, without statistics getters. Consequently the
-observed plan clears the cache before projecting counter values. Keeping the
-snapshot flat matters to this analysis; it should not be generalized to an
-arbitrary source query or an extra subquery that evaluates getters earlier.
+All snapshots now use a zero OFFSET InitPlan to consume the corresponding clear
+CTE before entering the source scan. This replaces the earlier CROSS JOIN
+implementation whose observed PostgreSQL 17.11 projection order was suitable but
+was source/plan-specific. Every delta now uses a named status guard, including
+the connection-count difference. Invalid rows retain start/end gauges but return
+NULL for num_backends_delta. See [current uniform policy](uniform-snapshots.md).
+The runtime comparison below records the earlier full-join revision.
 
 Concurrent tests exercised cached reads in none, cache and snapshot modes, as
 well as these additional configurations (with JIT disabled for the deliberately

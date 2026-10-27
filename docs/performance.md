@@ -1,10 +1,15 @@
 # Query plans and performance evidence
 
-All five functions in version 0.1.0 now use flat native snapshots and FULL OUTER
-JOIN. The comparisons below evaluate complete implementations, including compact
+The five object samplers in version 0.1.0 use flat native snapshots and FULL OUTER
+JOIN. The new singleton WAL sampler uses a CROSS JOIN without sorting; see
+[WAL query](wal-query.md). The comparisons below evaluate complete implementations, including compact
 result changes and correctness fixes, not isolated join algorithms.
 
-## Current comparisons
+Current query ordering and guarded-subtraction changes are described in
+[uniform-snapshots.md](uniform-snapshots.md). The table below records the preceding
+full-join revision, not a fresh measurement of the uniform queries.
+
+## Earlier full-join comparisons
 
 | Function | Tested catalog | Previous median | Current median | Analysis |
 | --- | --- | --- | --- | --- |
@@ -33,6 +38,7 @@ Use a representative disposable database and standard PGHOST, PGPORT, PGDATABASE
 and PGUSER settings, optionally PSQL to select a client:
 
 ```sh
+python3 tests/explain_statistics.py --view wal
 python3 tests/explain_statistics.py --view database
 python3 tests/explain_statistics.py --view tables
 python3 tests/explain_statistics.py --view indexes

@@ -3,7 +3,7 @@
 On-demand PostgreSQL statistics deltas, without snapshot tables or background
 workers. Version 0.1.0 provides `pg_stat_database_delta`,
 `pg_stat_user_tables_delta`, `pg_stat_user_indexes_delta`,
-`pg_statio_user_tables_delta`, and `pg_statio_user_indexes_delta`.
+`pg_statio_user_tables_delta`, `pg_statio_user_indexes_delta`, and `pg_stat_wal_delta`.
 Each accepts `i_delta_seconds numeric DEFAULT 5`.
 Implemented in PL/pgSQL; currently tested on **PostgreSQL 17.11**.
 
@@ -16,10 +16,11 @@ Implemented in PL/pgSQL; currently tested on **PostgreSQL 17.11**.
 | `pg_stat_user_indexes_delta` | `pg_stat_user_indexes` | `indexrelid` |
 | `pg_statio_user_tables_delta` | `pg_statio_user_tables` | `relid` |
 | `pg_statio_user_indexes_delta` | `pg_statio_user_indexes` | `indexrelid` |
+| `pg_stat_wal_delta` | `pg_stat_wal` | One cluster-wide row |
 
 Each call reads two flat snapshots in one SQL query, waits between them, clears
-the statistics cache for each read, and matches rows with FULL OUTER JOIN. All
-functions return `sampled_at_start`, `sampled_at_end`, `elapsed_seconds` and
+the statistics cache for each read, and matches object rows with FULL OUTER JOIN.
+WAL uses a singleton CROSS JOIN. All functions return `sampled_at_start`, `sampled_at_end`, `elapsed_seconds` and
 `status`. Cumulative differences use `_delta`; state estimates and last-event
 timestamps are separate values. Database scope includes its shared-object row;
 the four relation samplers follow their source user views in the current database.
@@ -28,11 +29,16 @@ the four relation samplers follow their source user views in the current databas
 | --- | --- | --- |
 | `ok` | No discontinuity detected; source NULLs remain NULL | All functions |
 | `reset` | A reset marker changed; table/index statistics also use this for counter decreases | All functions |
-| `counter_decreased` | A block counter decreased without a changed reset marker | Both I/O functions |
-| `missing` | An identity exists in only one sampled row set | All functions |
+| `counter_decreased` | An I/O or WAL counter decreased without a changed reset marker | Both I/O functions and WAL |
+| `missing` | An identity exists in only one sampled row set | Object samplers |
 
-**Every cumulative delta is NULL for a non-ok row.** Connection counts, table
-state estimates and last-event times can remain available where a snapshot exists.
+**Every delta is NULL for a non-ok row**, including `num_backends_delta`.
+Connection start/end counts, table state estimates and last-event times can remain
+available where a snapshot exists. All six functions clear caches before each
+snapshot using `OFFSET (SELECT count(*) - 1 FROM initial_clear)` and the matching
+`second_clear` dependency. Each subtraction occurs inside `CASE WHEN status =
+'ok' THEN end_value - start_value END`; invalid rows never subtract counters.
+See [uniform query policy](docs/uniform-snapshots.md).
 A valid zero means no published counter change; NULL means unavailable or invalid,
 not zero activity. `ok` does not certify an atomic measurement or absence of DDL.
 The single statement retains its MVCC catalog snapshot, so `missing` is defensive
@@ -93,7 +99,7 @@ SELECT * FROM pg_stat_database_delta(1.5);    -- fractional seconds are supporte
 
 During development all functions remain in **version 0.1.0**. New functions do
 not introduce additional extension versions or upgrade scripts. The complete
-`sql/pg_stat_delta--0.1.0.sql` is built from the five named per-function SQL source
+`sql/pg_stat_delta--0.1.0.sql` is built from the six named per-function SQL source
 files and kept in the repository for direct review. Run make after editing a
 function; make install also rebuilds the installation script when necessary.
 
@@ -121,10 +127,11 @@ The database function uses one SQL query with two materialized, **flat**
 for further database-query optimization. It avoids composite-record field access,
 `UNION ALL` and window functions. The table and index samplers also use full joins,
 as described below.
-All five samplers now use flat snapshots and FULL OUTER JOIN, with explicit
-pre-scan cache-clear barriers retained for the aggregate table views.
+The five object samplers use flat snapshots and FULL OUTER JOIN. All six
+samplers, including WAL, retain explicit pre-scan cache-clear OFFSET barriers.
 
-`pg_stat_clear_snapshot()` runs for each read through the singleton clear CTE.
+`pg_stat_clear_snapshot()` runs for each read through the singleton clear CTE,
+consumed by the snapshot OFFSET InitPlan before entering the source scan.
 Aggregates in `first_time` and `second_time` fully consume their respective
 snapshots and yield one timing row. The second clear depends on the sleep.
 The final join preserves a row even if only one snapshot contains its OID.
@@ -149,8 +156,8 @@ NULL database name).
 | `session_time_delta`, `active_time_delta`, `idle_in_transaction_time_delta` | Published session, active, and idle-in-transaction time deltas in milliseconds |
 | `sessions_delta` | Change in established sessions, not the instantaneous connection count |
 
-For `reset` or `missing`, **all cumulative counter deltas are NULL**. Connection
-measurements remain available wherever the snapshot exists. `stats_reset` is
+For `reset` or `missing`, **all deltas are NULL**, including `num_backends_delta`.
+Connection start/end counts remain available wherever the snapshot exists. `stats_reset` is
 compared internally; equal NULL markers are accepted. `missing` denotes an OID
 present in only one snapshot and is a defensive case, not a promise of live
 catalog refresh. The statement still uses one MVCC catalog snapshot.
@@ -452,17 +459,57 @@ block-read deltas after a second clean restart of that temporary cluster.
 * Only the listed counters are included. Other PostgreSQL versions and
   statement deltas are unverified.
 
+## WAL statistics
+
+```sql
+SELECT * FROM pg_stat_wal_delta(1);
+```
+
+The source is `pg_stat_wal`: exactly one row for the **whole cluster**, including
+activity from other databases and background processes. The result contains the
+four common timing/status columns and these eight deltas:
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `wal_records_delta` | bigint | WAL records generated |
+| `wal_fpi_delta` | bigint | Full-page images generated |
+| `wal_bytes_delta` | numeric | WAL bytes generated |
+| `wal_buffers_full_delta` | bigint | WAL writes caused by full WAL buffers |
+| `wal_write_delta` | bigint | WAL write requests |
+| `wal_sync_delta` | bigint | WAL synchronization requests |
+| `wal_write_time_delta` | double precision | WAL write time, milliseconds |
+| `wal_sync_time_delta` | double precision | WAL synchronization time, milliseconds |
+
+Times depend on `track_wal_io_timing`; a zero does not establish absence of I/O.
+Synchronization counts/times also depend on `wal_sync_method`; methods performing
+synchronization within the write do not report separate sync operations in the
+same way. These are PostgreSQL WAL statistics, not physical-device measurements.
+
+A changed source `stats_reset` produces `reset`; any decreased counter without a
+changed marker produces `counter_decreased`. Either invalidates **all eight**
+deltas. Otherwise status is `ok`. The reset marker stays internal. No per-database
+marker, object identifier, `missing` status, sort or identity matching is needed.
+A reset is visible even when new activity has already overtaken old counters.
+
+Two materialized native snapshots are separated by the requested wait. A zero
+OFFSET InitPlan forces each cache clear before the source Function Scan starts;
+this is needed because `pg_stat_wal` calls `pg_stat_get_wal()` in FROM. See
+[docs/wal-query.md](docs/wal-query.md) for ordering and test details. Statistics
+publication remains asynchronous; clearing this session's cache cannot force
+other processes to publish. The common elapsed-time semantics apply.
+
 ## Integration tests
 
-The suite currently contains **54 integration test methods**; some exercise
+The suite currently contains **60 integration test methods**; some exercise
 multiple cache modes or edge cases. The complete suite passed on PostgreSQL 17.11
-with the current five-function implementation. The optional private-cluster cold
+with the current six-function implementation. The optional private-cluster cold
 block-read check also passed.
 
 Tests require Python 3, `psql`, and a running PostgreSQL 17 server. Use a
-**disposable test database and cluster**: tests reset database statistics, create
-and drop databases, tables and a role, and temporarily move the extension between schemas.
-Tests require the current 0.1.0 files and all five functions loaded in the
+**disposable test database and cluster**: tests reset database and cluster-wide
+WAL statistics, create and drop databases, tables and a role, and temporarily move
+the extension between schemas.
+Tests require the current 0.1.0 files and all six functions loaded in the
 selected test database.
 The connection needs administrative privileges. No Python packages are required.
 Cache tests explicitly read sum() of a statistic before sampling (for example,
@@ -485,9 +532,14 @@ Table tests cover DML, index scans, maintenance gauges, and table resets even wh
 counters catch up. Index tests cover plain, bitmap, and index-only scans, resets,
 DDL visibility and repeated calls. I/O tests cover heap, index and TOAST buffer
 hits, NULL components, user-only scope, resets, DDL and cache modes. Index I/O
-tests also distinguish indexes of the same table. Installation tests verify that
+tests also distinguish indexes of the same table. WAL tests cover real inserts in
+all three cache modes, alternate plans, shared WAL reset followed by new activity,
+native numeric bytes, and each individual counter decreasing. A controlled-snapshot
+regression checks all six queries with invalid rows whose bigint subtraction
+would overflow: every delta must be NULL without an arithmetic error. Installation tests
+verify that
 only 0.1.0 is available, both default and explicit version selection install all
-five extension members, and extension removal cleans up those functions. These
+six extension members, and extension removal cleans up those functions. These
 checks include another schema and empty user-table/index sets in a separate
 disposable database. Sampling tests wait until the measurement connection enters
 `pg_sleep` before generating activity.

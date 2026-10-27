@@ -154,6 +154,7 @@ class DeltaTests(unittest.TestCase):
             self.assertEqual(by_id[oid]['status'], 'reset' if oid == 90004 else 'missing')
             for counter in counters:
                 self.assertIsNone(by_id[oid][counter+'_delta'])
+            self.assertIsNone(by_id[oid]['num_backends_delta'])
         self.assertEqual(by_id[0]['status'], 'ok')
         self.assertIsNone(by_id[0]['datname'])
         for counter in counters:
@@ -972,12 +973,153 @@ class IndexIODeltaTests(unittest.TestCase):
         self.assertEqual(result.splitlines().count('t'), 2)
 
 
+class WALDeltaTests(unittest.TestCase):
+    sample = DeltaTests.sample
+    counters = ('wal_records wal_fpi wal_bytes wal_buffers_full wal_write wal_sync '
+                'wal_write_time wal_sync_time').split()
+
+    @classmethod
+    def setUpClass(cls):
+        sql('CREATE EXTENSION IF NOT EXISTS pg_stat_delta')
+        sql('CREATE TABLE delta_wal_test (id integer, payload text)')
+
+    @classmethod
+    def tearDownClass(cls):
+        sql('DROP TABLE delta_wal_test')
+
+    def workload(self):
+        sql("INSERT INTO delta_wal_test SELECT i, repeat(md5(i::text), 100) "
+            "FROM generate_series(1,1000) i; SELECT pg_stat_force_next_flush()")
+
+    def test_validation_and_types(self):
+        for value in ['NULL', '-1', "'NaN'", "'Infinity'", "'-Infinity'"]:
+            result = subprocess.run([PSQL, '-X', '-v', 'ON_ERROR_STOP=1', '-c',
+                                    f'SELECT * FROM pg_stat_wal_delta({value})'],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('finite nonnegative', result.stderr)
+        self.assertEqual(sql("SELECT count(*)=1 AND bool_and(status='ok' AND elapsed_seconds>=0) "
+                             'FROM pg_stat_wal_delta(0)'), 't')
+        self.assertEqual(sql('SELECT pg_typeof(wal_bytes_delta) FROM pg_stat_wal_delta(0)'), 'numeric')
+
+    def test_workload_and_cache_modes(self):
+        for mode in ['none', 'cache', 'snapshot']:
+            row, = self.sample(self.workload,
+                f"BEGIN; SET LOCAL stats_fetch_consistency='{mode}'; "
+                'SELECT wal_records FROM pg_stat_wal; ', function='pg_stat_wal_delta')
+            self.assertEqual(row['status'], 'ok')
+            self.assertGreater(row['wal_records_delta'], 0)
+            self.assertGreater(row['wal_bytes_delta'], 0)
+            self.assertGreaterEqual(row['elapsed_seconds'], 1.5)
+            for counter in self.counters:
+                self.assertGreaterEqual(row[counter+'_delta'], 0)
+
+    def test_reset_with_new_activity(self):
+        def reset():
+            sql("SELECT pg_stat_reset_shared('wal')")
+            self.workload()
+        row, = self.sample(reset, function='pg_stat_wal_delta')
+        self.assertEqual(row['status'], 'reset')
+        for counter in self.counters:
+            self.assertIsNone(row[counter+'_delta'])
+
+    def test_alternative_plans(self):
+        for settings in [
+            'SET LOCAL enable_hashjoin=off; SET LOCAL join_collapse_limit=1; '
+            'SET LOCAL from_collapse_limit=1; ',
+            'SET LOCAL enable_mergejoin=off; SET LOCAL enable_nestloop=off; '
+            'SET LOCAL enable_material=off; ',
+        ]:
+            row, = self.sample(self.workload,
+                "BEGIN; SET LOCAL jit=off; SET LOCAL stats_fetch_consistency='snapshot'; "
+                + settings + 'SELECT wal_records FROM pg_stat_wal; ',
+                function='pg_stat_wal_delta')
+            self.assertEqual(row['status'], 'ok')
+            self.assertGreater(row['wal_records_delta'], 0)
+
+    def test_controlled_counters(self):
+        source = (Path(__file__).resolve().parents[1] / 'sql/pg_stat_wal_delta.sql').read_text()
+        query = source.split('RETURN QUERY\n', 1)[1].split('\nEND;', 1)[0]
+        query = query.replace('i_delta_seconds::double precision', '0::double precision').rstrip().rstrip(';')
+        def fixture(values, reset):
+            fields = [str(v)+'::'+('numeric' if c=='wal_bytes' else
+                      'double precision' if c.endswith('_time') else 'bigint')
+                      for c,v in zip(self.counters, values)]
+            fields.append(reset+'::timestamptz')
+            return ('FROM (VALUES ('+','.join(fields)+')) AS w('
+                    + ','.join(self.counters+['stats_reset'])+')')
+        before = [10]*8
+        # Beyond bigint range: wal_bytes must retain native numeric precision.
+        before[2] = 10**24
+        after = [x+7 for x in before]
+        cases = [(after, 'NULL', 'ok'), (after, "'2026-10-27 UTC'", 'reset')]
+        for i in range(8):
+            decreased = after.copy()
+            decreased[i] = before[i]-1
+            cases.append((decreased, 'NULL', 'counter_decreased'))
+        for values, reset, status in cases:
+            q = query.replace('FROM pg_stat_wal AS w', fixture(before, 'NULL'), 1)
+            q = q.replace('FROM pg_stat_wal AS w', fixture(values, reset), 1)
+            row = json.loads(sql('SELECT to_jsonb(q) FROM ('+q+') q'))
+            self.assertEqual(row['status'], status)
+            for counter in self.counters:
+                self.assertEqual(row[counter+'_delta'], 7 if status=='ok' else None)
+
+
+class InvalidDeltaArithmeticTests(unittest.TestCase):
+    def test_invalid_snapshots_skip_subtraction(self):
+        # Invalid rows must not subtract counters at all: a bigint difference
+        # could overflow even though its result should have been discarded.
+        cases = [
+            ('pg_stat_database', 'd', 'xact_commit', None, 'reset'),
+            ('pg_stat_user_tables', 't', 'n_tup_ins', 'seq_scan', 'reset'),
+            ('pg_stat_user_indexes', 'i', 'idx_tup_read', 'idx_scan', 'reset'),
+            ('pg_statio_user_tables', 't', 'heap_blks_hit', 'heap_blks_read', 'counter_decreased'),
+            ('pg_statio_user_indexes', 'i', 'idx_blks_hit', 'idx_blks_read', 'counter_decreased'),
+            ('pg_stat_wal', 'w', 'wal_fpi', 'wal_records', 'counter_decreased'),
+        ]
+        for view, alias, overflow, decrease, status in cases:
+            with self.subTest(view=view):
+                columns = json.loads(sql("SELECT json_agg(json_build_array(attname, "
+                    "format_type(atttypid, atttypmod))) FROM pg_attribute "
+                    f"WHERE attrelid='{view}'::regclass AND attnum>0 AND NOT attisdropped"))
+                def fixture(second):
+                    fields = []
+                    for name, typ in columns:
+                        if name == overflow:
+                            value = '9223372036854775807' if second else '-9223372036854775807'
+                        elif name == decrease:
+                            value = '9' if second else '10'
+                        elif name == 'stats_reset':
+                            value = "'2026-01-02 UTC'" if second and decrease is None else "'2026-01-01 UTC'"
+                        elif typ == 'oid':
+                            value = '1'
+                        elif typ == 'name':
+                            value = "'fixture'"
+                        elif typ in ['bigint', 'integer', 'numeric', 'double precision']:
+                            value = '0'
+                        else:
+                            value = 'NULL'
+                        fields.append(f'{value}::{typ} AS {name}')
+                    return 'FROM (SELECT '+', '.join(fields)+f') AS {alias}'
+                source = (Path(__file__).resolve().parents[1] / 'sql' / (view+'_delta.sql')).read_text()
+                query = source.split('RETURN QUERY\n', 1)[1].split('\nEND;', 1)[0]
+                query = query.replace(f'FROM {view} AS {alias}', fixture(False), 1)
+                query = query.replace(f'FROM {view} AS {alias}', fixture(True), 1)
+                query = query.replace('i_delta_seconds::double precision', '0::double precision').rstrip().rstrip(';')
+                row = json.loads(sql('SELECT to_jsonb(q) FROM ('+query+') q'))
+                self.assertEqual(row['status'], status)
+                for name, value in row.items():
+                    if name.endswith('_delta'):
+                        self.assertIsNone(value, name)
+
+
 class InstallationTests(unittest.TestCase):
     def test_single_version_install(self):
         name = 'delta_test_installation'
         functions = ['pg_stat_database_delta', 'pg_stat_user_tables_delta',
                      'pg_stat_user_indexes_delta', 'pg_statio_user_tables_delta',
-                     'pg_statio_user_indexes_delta']
+                     'pg_statio_user_indexes_delta', 'pg_stat_wal_delta']
         sql(f'CREATE DATABASE {name}')
         try:
             self.assertEqual(sql("SELECT version FROM pg_available_extension_versions "
@@ -991,18 +1133,18 @@ class InstallationTests(unittest.TestCase):
                                      PGDATABASE=name), '0.1.0')
                 for function in functions:
                     rows = sql(f'SELECT count(*) FROM {schema}.{function}(0)', PGDATABASE=name)
-                    if function == 'pg_stat_database_delta':
+                    if function in ['pg_stat_database_delta', 'pg_stat_wal_delta']:
                         self.assertGreater(int(rows), 0)
                     else:
                         self.assertEqual(rows, '0')
-                # All five functions must be extension members, not loose SQL objects.
+                # All six functions must be extension members, not loose SQL objects.
                 self.assertEqual(sql("SELECT count(*) FROM pg_depend d "
                                      "JOIN pg_extension e ON e.oid=d.refobjid "
                                      "JOIN pg_proc p ON p.oid=d.objid "
                                      "WHERE e.extname='pg_stat_delta' AND d.deptype='e' "
                                      "AND d.classid='pg_proc'::regclass "
                                      "AND d.refclassid='pg_extension'::regclass",
-                                     PGDATABASE=name), '5')
+                                     PGDATABASE=name), '6')
                 start = time.monotonic()
                 sql(f'SELECT count(*) FROM {schema}.pg_statio_user_indexes_delta(0.1)', PGDATABASE=name)
                 self.assertGreaterEqual(time.monotonic() - start, .1)

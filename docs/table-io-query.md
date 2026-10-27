@@ -36,10 +36,11 @@ general ordering guarantee for source aggregates. The reason is commented next
 to both OFFSET clauses. Sleep remains dependent on complete first-snapshot
 consumption, and timing aggregates return one row even for an empty user set.
 
-The measured subquery contains flat identities, timing, status, and differences.
-Its OFFSET 0 prevents expansion of the eight-counter status check into every
-output CASE, without a third materialized snapshot. No WindowAgg or JSON remains.
-The query still has the requested final schema/name sort.
+The measured CTE now passes raw counter endpoints to status-ok CASE expressions;
+invalid rows never perform subtraction. OFFSET 0 was removed: it does not
+guarantee a single status evaluation in all plans. See the
+[current uniform policy](uniform-snapshots.md). The measurements below record
+the earlier corrected full-join implementation.
 
 ## Validation
 

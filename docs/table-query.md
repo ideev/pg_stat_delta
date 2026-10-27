@@ -51,10 +51,12 @@ appropriate clear CTE before entering the source view. The second clear depends
 on sleep; timing aggregates consume whole snapshots and still return one timing
 row when no user tables exist. The OFFSET explanation is next to the SQL.
 
-A flat measured subquery computes status and raw differences once per row.
-OFFSET 0 prevents inlining that would duplicate the nine-counter validity test
-for every output delta; it does not create another materialized snapshot. The
-outer projection returns cumulative deltas only when status is ok.
+A flat measured CTE names status and raw counter endpoints. Each difference is
+computed only inside its status-ok CASE, so invalid rows cannot trigger arithmetic
+overflow. The former OFFSET 0 and its claim of guaranteed single evaluation have
+been removed; ordinary CTE expressions may be expanded. See the
+[current uniform policy](uniform-snapshots.md); the measurements below concern
+the earlier full-join implementation.
 
 ## Verified checks
 

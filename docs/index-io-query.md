@@ -35,18 +35,14 @@ without composite records or JSON. Timing aggregates fully consume each snapshot
 and yield exactly one timing row, including for an empty index set. The second
 clear depends on sleep.
 
-EXPLAIN VERBOSE on PostgreSQL 17.11 showed statistics getters only in the root
-Nested Loop projection of each snapshot. The clear CTE is a relational input
-below that projection, so the verified plans consume clearing before evaluating
-the getters. As for the index-statistics sampler, this view does not have the
-index aggregation that required a pre-scan OFFSET barrier in the table samplers.
-CROSS JOIN textual order alone is not a general SQL side-effect-order guarantee;
-recheck plans and concurrent tests on query-shape or PostgreSQL changes.
-
-The measured subquery calculates status and differences once per row. OFFSET 0
-prevents inlining and duplicate validity calculations without another materialized
-snapshot. There is no WindowAgg. Final ordering is by schema, table and index.
-Index identity, not table relid or names, is used for matching.
+Both snapshots now use zero OFFSET InitPlans to execute their clear CTEs before
+source scanning, rather than depending on the earlier flat-projection CROSS JOIN
+plans. The measured CTE names status and raw counter endpoints. Every subtraction
+is inside CASE WHEN status is ok; no OFFSET 0 or extra materialization is used to
+claim a single status calculation. See [uniform policy](uniform-snapshots.md).
+There is no WindowAgg. Final ordering is by schema, table and index. Index
+identity, not table relid or names, is used for matching. The measurements below
+record the earlier corrected full-join implementation.
 
 ## Validation
 

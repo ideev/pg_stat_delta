@@ -75,32 +75,29 @@ BEGIN
                       OR s2.tidx_blks_read < s1.tidx_blks_read
                       OR s2.tidx_blks_hit < s1.tidx_blks_hit THEN 'counter_decreased'
                     ELSE 'ok' END AS status,
-               s2.heap_blks_read - s1.heap_blks_read AS heap_blks_read_delta,
-               s2.heap_blks_hit - s1.heap_blks_hit AS heap_blks_hit_delta,
-               s2.idx_blks_read - s1.idx_blks_read AS idx_blks_read_delta,
-               s2.idx_blks_hit - s1.idx_blks_hit AS idx_blks_hit_delta,
-               s2.toast_blks_read - s1.toast_blks_read AS toast_blks_read_delta,
-               s2.toast_blks_hit - s1.toast_blks_hit AS toast_blks_hit_delta,
-               s2.tidx_blks_read - s1.tidx_blks_read AS tidx_blks_read_delta,
-               s2.tidx_blks_hit - s1.tidx_blks_hit AS tidx_blks_hit_delta
+               s1.heap_blks_read AS heap_blks_read_start, s2.heap_blks_read AS heap_blks_read_end,
+               s1.heap_blks_hit AS heap_blks_hit_start, s2.heap_blks_hit AS heap_blks_hit_end,
+               s1.idx_blks_read AS idx_blks_read_start, s2.idx_blks_read AS idx_blks_read_end,
+               s1.idx_blks_hit AS idx_blks_hit_start, s2.idx_blks_hit AS idx_blks_hit_end,
+               s1.toast_blks_read AS toast_blks_read_start, s2.toast_blks_read AS toast_blks_read_end,
+               s1.toast_blks_hit AS toast_blks_hit_start, s2.toast_blks_hit AS toast_blks_hit_end,
+               s1.tidx_blks_read AS tidx_blks_read_start, s2.tidx_blks_read AS tidx_blks_read_end,
+               s1.tidx_blks_hit AS tidx_blks_hit_start, s2.tidx_blks_hit AS tidx_blks_hit_end
         FROM first_snapshot AS s1
         FULL OUTER JOIN second_snapshot AS s2 ON s1.relid = s2.relid
         CROSS JOIN first_time AS t1
         CROSS JOIN second_time AS t2
-        -- Compute the eight-counter validity test once per row rather than once
-        -- for every output delta, without another materialized snapshot.
-        OFFSET 0
     )
     SELECT m.relid, m.schemaname, m.relname,
            m.sampled_at_start, m.sampled_at_end, m.elapsed_seconds, m.status,
-           CASE WHEN m.status = 'ok' THEN m.heap_blks_read_delta END AS heap_blks_read_delta,
-           CASE WHEN m.status = 'ok' THEN m.heap_blks_hit_delta END AS heap_blks_hit_delta,
-           CASE WHEN m.status = 'ok' THEN m.idx_blks_read_delta END AS idx_blks_read_delta,
-           CASE WHEN m.status = 'ok' THEN m.idx_blks_hit_delta END AS idx_blks_hit_delta,
-           CASE WHEN m.status = 'ok' THEN m.toast_blks_read_delta END AS toast_blks_read_delta,
-           CASE WHEN m.status = 'ok' THEN m.toast_blks_hit_delta END AS toast_blks_hit_delta,
-           CASE WHEN m.status = 'ok' THEN m.tidx_blks_read_delta END AS tidx_blks_read_delta,
-           CASE WHEN m.status = 'ok' THEN m.tidx_blks_hit_delta END AS tidx_blks_hit_delta
+           CASE WHEN m.status = 'ok' THEN m.heap_blks_read_end - m.heap_blks_read_start END AS heap_blks_read_delta,
+           CASE WHEN m.status = 'ok' THEN m.heap_blks_hit_end - m.heap_blks_hit_start END AS heap_blks_hit_delta,
+           CASE WHEN m.status = 'ok' THEN m.idx_blks_read_end - m.idx_blks_read_start END AS idx_blks_read_delta,
+           CASE WHEN m.status = 'ok' THEN m.idx_blks_hit_end - m.idx_blks_hit_start END AS idx_blks_hit_delta,
+           CASE WHEN m.status = 'ok' THEN m.toast_blks_read_end - m.toast_blks_read_start END AS toast_blks_read_delta,
+           CASE WHEN m.status = 'ok' THEN m.toast_blks_hit_end - m.toast_blks_hit_start END AS toast_blks_hit_delta,
+           CASE WHEN m.status = 'ok' THEN m.tidx_blks_read_end - m.tidx_blks_read_start END AS tidx_blks_read_delta,
+           CASE WHEN m.status = 'ok' THEN m.tidx_blks_hit_end - m.tidx_blks_hit_start END AS tidx_blks_hit_delta
     FROM measured AS m
     ORDER BY m.schemaname, m.relname;
 END;
