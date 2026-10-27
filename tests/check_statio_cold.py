@@ -64,5 +64,23 @@ with tempfile.TemporaryDirectory(prefix='delta-statio-cold-',dir='/tmp') as root
             print(json.dumps([{k:r[k] for k in ['indexrelname','idx_blks_read_delta',
                                               'idx_blks_hit_delta']} for r in index_rows]))
 
+
+            # Verify real pg_stat_io reads/timings after another private restart.
+            pg('pg_ctl','-D',data,'-m','fast','stop')
+            pg('pg_ctl','-D',data,'-l',root/'server.log','-o',f'-k {root} -p 5432 -h ""','start')
+            io_rows = case.sample(lambda: tests.sql(
+                'SET track_io_timing=on; '
+                'SELECT sum(payload) FROM delta_statio_tests.heap; '
+                'SELECT md5(payload) FROM delta_statio_tests.toasted; '
+                'SELECT pg_stat_force_next_flush();'), function='pg_stat_io_delta',
+                condition="backend_type='client backend' AND object='relation'")
+            assert io_rows and all(r['status']=='ok' for r in io_rows), io_rows
+            reads = sum(r['reads_delta'] or 0 for r in io_rows)
+            read_time = sum(r['read_time_delta'] or 0 for r in io_rows)
+            assert reads > 0, io_rows
+            assert read_time > 0, io_rows
+            print(json.dumps({'pg_stat_io_reads_delta':reads,
+                              'pg_stat_io_read_time_delta_ms':read_time}))
+
     finally:
         pg('pg_ctl','-D',data,'-m','fast','stop')

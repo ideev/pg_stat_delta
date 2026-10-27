@@ -194,8 +194,11 @@ class DeltaTests(unittest.TestCase):
                          'SELECT count(*)>=0 FROM delta_test_schema.pg_stat_user_tables_delta(0); '
                          'SELECT count(*)>=0 FROM delta_test_schema.pg_stat_user_indexes_delta(0); '
                          'SELECT count(*)>=0 FROM delta_test_schema.pg_statio_user_tables_delta(0); '
-                         'SELECT count(*)>=0 FROM delta_test_schema.pg_statio_user_indexes_delta(0);')
-            self.assertEqual(result.splitlines()[-1], 't')
+                         'SELECT count(*)>=0 FROM delta_test_schema.pg_statio_user_indexes_delta(0); '
+                         'SELECT count(*)>0 FROM delta_test_schema.pg_stat_wal_delta(0); '
+                         'SELECT count(*)>0 FROM delta_test_schema.pg_stat_io_delta(0); '
+                         'SELECT count(*)>=0 FROM delta_test_schema.pg_stat_user_functions_delta(0);')
+            self.assertEqual(result.splitlines().count('t'), 8)
         finally:
             sql('ALTER EXTENSION pg_stat_delta SET SCHEMA public; '
                 'DROP SCHEMA delta_test_schema; DROP ROLE delta_test_reader;')
@@ -1066,6 +1069,329 @@ class WALDeltaTests(unittest.TestCase):
                 self.assertEqual(row[counter+'_delta'], 7 if status=='ok' else None)
 
 
+class IODeltaTests(unittest.TestCase):
+    sample = DeltaTests.sample
+    counters = ('reads read_time writes write_time writebacks writeback_time '
+                'extends extend_time hits evictions reuses fsyncs fsync_time').split()
+
+    @classmethod
+    def setUpClass(cls):
+        sql('CREATE EXTENSION IF NOT EXISTS pg_stat_delta')
+        sql('CREATE TABLE delta_io_test (id integer PRIMARY KEY, payload integer); '
+            'INSERT INTO delta_io_test SELECT i,i FROM generate_series(1,1000) i')
+
+    @classmethod
+    def tearDownClass(cls):
+        sql('DROP TABLE delta_io_test')
+
+    def workload(self):
+        sql('UPDATE delta_io_test SET payload=payload+1 WHERE id<=100; '
+            'SELECT pg_stat_force_next_flush()')
+
+    def io_sample(self, action, prefix=''):
+        return self.sample(action, prefix, function='pg_stat_io_delta')
+
+    def normal(self, rows):
+        return next(r for r in rows if (r['backend_type'],r['object'],r['context']) ==
+                    ('client backend','relation','normal'))
+
+    def test_validation_and_zero(self):
+        for value in ['NULL', '-1', "'NaN'", "'Infinity'", "'-Infinity'"]:
+            result = subprocess.run([PSQL, '-X', '-v', 'ON_ERROR_STOP=1', '-c',
+                                     f'SELECT * FROM pg_stat_io_delta({value})'],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('finite nonnegative', result.stderr)
+        rows=json.loads(sql('SELECT json_agg(d) FROM pg_stat_io_delta(0) d'))
+        keys=[(r['backend_type'],r['object'],r['context']) for r in rows]
+        self.assertEqual(keys, sorted(set(keys)))
+        self.assertTrue(all(r['status']=='ok' and r['elapsed_seconds']>=0 for r in rows))
+        self.assertTrue(all(r['op_bytes']>0 for r in rows))
+        self.assertEqual(sql('SELECT pg_typeof(op_bytes) FROM pg_stat_io_delta(0) LIMIT 1'),'bigint')
+
+    def test_workload_and_cache_modes(self):
+        for mode in ['none','cache','snapshot']:
+            row=self.normal(self.io_sample(self.workload,
+                f"BEGIN; SET LOCAL stats_fetch_consistency='{mode}'; "
+                'SELECT sum(hits) FROM pg_stat_io; '))
+            self.assertEqual(row['status'],'ok')
+            self.assertGreater(row['hits_delta'],0)
+            self.assertGreaterEqual(row['elapsed_seconds'],1.5)
+            for c in self.counters:
+                if row[c+'_delta'] is not None:
+                    self.assertGreaterEqual(row[c+'_delta'],0)
+
+    def test_reset_with_activity(self):
+        def reset():
+            sql("SELECT pg_stat_reset_shared('io')")
+            self.workload()
+        rows=self.io_sample(reset)
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(row['status'],'reset')
+            for c in self.counters:
+                self.assertIsNone(row[c+'_delta'])
+
+    def test_temp_relations(self):
+        def workload():
+            sql('CREATE TEMP TABLE delta_io_temp (id integer); '
+                'INSERT INTO delta_io_temp SELECT i FROM generate_series(1,1000) i; '
+                'SELECT sum(id) FROM delta_io_temp; SELECT pg_stat_force_next_flush()')
+        rows=self.io_sample(workload)
+        row=next(r for r in rows if (r['backend_type'],r['object'],r['context'])==
+                 ('client backend','temp relation','normal'))
+        self.assertEqual(row['status'],'ok')
+        self.assertGreater(row['hits_delta'],0)
+        self.assertGreater(row['extends_delta'],0)
+        self.assertIsNone(row['fsyncs_delta'])
+        self.assertIsNone(row['fsync_time_delta'])
+
+    def test_alternative_plans(self):
+        for settings in [
+            'SET LOCAL enable_hashjoin=off; SET LOCAL join_collapse_limit=1; '
+            'SET LOCAL from_collapse_limit=1; ',
+            'SET LOCAL enable_mergejoin=off; SET LOCAL enable_nestloop=off; '
+            'SET LOCAL enable_material=off; ',
+        ]:
+            row=self.normal(self.io_sample(self.workload,
+                "BEGIN; SET LOCAL jit=off; SET LOCAL stats_fetch_consistency='snapshot'; "
+                +settings+'SELECT sum(hits) FROM pg_stat_io; '))
+            self.assertEqual(row['status'],'ok')
+            self.assertGreater(row['hits_delta'],0)
+
+    def test_repeated_calls(self):
+        out=sql("BEGIN; SET LOCAL stats_fetch_consistency='snapshot'; "
+                'SELECT sum(hits) FROM pg_stat_io; '
+                'SELECT bool_and(status=\'ok\' AND elapsed_seconds>=0.05) FROM pg_stat_io_delta(0.05); '
+                'SELECT bool_and(status=\'ok\' AND elapsed_seconds>=0.05) FROM pg_stat_io_delta(0.05); COMMIT;')
+        self.assertEqual(out.splitlines()[-3:],['t','t','COMMIT'])
+
+    def test_controlled_snapshots(self):
+        source=(Path(__file__).resolve().parents[1]/'sql/pg_stat_io_delta.sql').read_text()
+        query=source.split('RETURN QUERY\n',1)[1].split('\nEND;',1)[0]
+        query=query.replace('i_delta_seconds::double precision','0::double precision').rstrip().rstrip(';')
+        def fixture(rows):
+            values=[]
+            for key,counters,reset in rows:
+                fields=["'"+k+"'::text" for k in key]+['8192::bigint']
+                fields += [('NULL' if v is None else str(v))+'::'+
+                           ('double precision' if c.endswith('_time') else 'bigint')
+                           for c,v in zip(self.counters,counters)]
+                fields += [reset+'::timestamptz']
+                values.append('('+','.join(fields)+')')
+            return ('FROM (VALUES '+','.join(values)+') AS i(backend_type,object,context,op_bytes,'+
+                    ','.join(self.counters)+',stats_reset)')
+        def execute(before,after):
+            q=query.replace('FROM pg_stat_io AS i',fixture(before),1)
+            q=q.replace('FROM pg_stat_io AS i',fixture(after),1)
+            return json.loads(sql('SELECT json_agg(q) FROM ('+q+') q'))
+        keys=[('client backend','relation','normal'),('client backend','temp relation','normal'),
+              ('client backend','relation','bulkread'),('background writer','relation','normal')]
+        before=[(k,[10]*13,'NULL') for k in keys]
+        after=[(k,[15]*13,'NULL') for k in keys[:3]]
+        after.append((('checkpointer','relation','normal'),[15]*13,'NULL'))
+        rows=execute(before,after)
+        self.assertEqual(len(rows),5)
+        for row in rows:
+            key=(row['backend_type'],row['object'],row['context'])
+            expected='ok' if key in keys[:3] else 'missing'
+            self.assertEqual(row['status'],expected)
+            for c in self.counters:
+                self.assertEqual(row[c+'_delta'],5 if expected=='ok' else None)
+        for i in range(13):
+            vals=[15]*13;vals[i]=9
+            row,=execute(before[:1],[(keys[0],vals,'NULL')])
+            self.assertEqual(row['status'],'counter_decreased')
+            for c in self.counters:self.assertIsNone(row[c+'_delta'])
+        row,=execute([(keys[0],[10]*13,"'2026-01-01 UTC'")],
+                     [(keys[0],[20]*13,"'2026-01-02 UTC'")])
+        self.assertEqual(row['status'],'reset')
+        for c in self.counters:self.assertIsNone(row[c+'_delta'])
+        vals=[None]*13;vals[0]=10
+        vals2=vals.copy();vals2[0]=15
+        row,=execute([(keys[0],vals,'NULL')],[(keys[0],vals2,'NULL')])
+        self.assertEqual(row['status'],'ok')
+        self.assertEqual(row['reads_delta'],5)
+        for c in self.counters[1:]:self.assertIsNone(row[c+'_delta'])
+
+
+class FunctionDeltaTests(unittest.TestCase):
+    sample = DeltaTests.sample
+    counters = ['calls', 'total_time', 'self_time']
+
+    @classmethod
+    def setUpClass(cls):
+        sql('CREATE EXTENSION IF NOT EXISTS pg_stat_delta')
+        sql('''CREATE SCHEMA delta_function_tests;
+            CREATE FUNCTION delta_function_tests.worker(i integer) RETURNS integer
+            LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.002); RETURN i+1; END $$;
+            CREATE FUNCTION delta_function_tests.worker(i text) RETURNS integer
+            LANGUAGE plpgsql AS $$ BEGIN RETURN length(i); END $$;
+            CREATE FUNCTION delta_function_tests.parent(i integer) RETURNS integer
+            LANGUAGE plpgsql AS $$ BEGIN RETURN delta_function_tests.worker(i); END $$;
+            CREATE FUNCTION delta_function_tests.untracked() RETURNS integer
+            LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;
+            CREATE FUNCTION delta_function_tests.first_seen() RETURNS integer
+            LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;
+            CREATE FUNCTION delta_function_tests.inline_sql(i integer) RETURNS integer
+            LANGUAGE sql IMMUTABLE AS $$ SELECT i+1 $$;''')
+        cls.worker = sql("SELECT 'delta_function_tests.worker(integer)'::regprocedure::oid")
+        cls.overload = sql("SELECT 'delta_function_tests.worker(text)'::regprocedure::oid")
+
+    @classmethod
+    def tearDownClass(cls):
+        sql('DROP SCHEMA delta_function_tests CASCADE')
+
+    def setUp(self):
+        sql("SET track_functions='pl'; SELECT delta_function_tests.worker(1); "
+            "SELECT delta_function_tests.worker('abc'::text); "
+            "SELECT delta_function_tests.parent(1); SELECT pg_stat_force_next_flush()")
+
+    def workload(self, n=17):
+        sql(f"SET track_functions='pl'; SELECT delta_function_tests.worker(i) "
+            f'FROM generate_series(1,{n}) i; SELECT pg_stat_force_next_flush()')
+
+    def function_sample(self, action, prefix=''):
+        return self.sample(action, prefix, function='pg_stat_user_functions_delta',
+                           condition="schemaname='delta_function_tests'")
+
+    def worker_row(self, rows):
+        return next(r for r in rows if int(r['funcid']) == int(self.worker))
+
+    def test_validation_and_zero(self):
+        for value in ['NULL', '-1', "'NaN'", "'Infinity'", "'-Infinity'"]:
+            result = subprocess.run([PSQL,'-X','-v','ON_ERROR_STOP=1','-c',
+                f'SELECT * FROM pg_stat_user_functions_delta({value})'],capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('finite nonnegative',result.stderr)
+        self.assertEqual(sql("SELECT bool_and(status='ok' AND elapsed_seconds>=0) "
+                             'FROM pg_stat_user_functions_delta(0)'), 't')
+
+    def test_calls_and_cache_modes(self):
+        for mode in ['none','cache','snapshot']:
+            rows=self.function_sample(self.workload,
+                f"BEGIN; SET LOCAL stats_fetch_consistency='{mode}'; "
+                'SELECT sum(calls) FROM pg_stat_user_functions; ')
+            row=self.worker_row(rows)
+            self.assertEqual(row['status'],'ok')
+            self.assertEqual(row['calls_delta'],17)
+            self.assertGreater(row['total_time_delta'],0)
+            self.assertGreater(row['self_time_delta'],0)
+            self.assertGreaterEqual(row['elapsed_seconds'],1.5)
+            overload=next(r for r in rows if int(r['funcid'])==int(self.overload))
+            self.assertEqual(overload['calls_delta'],0)
+            self.assertEqual(overload['funcname'],row['funcname'])
+
+    def test_nested_time(self):
+        def workload():
+            sql("SET track_functions='pl'; SELECT delta_function_tests.parent(i) "
+                'FROM generate_series(1,10) i; SELECT pg_stat_force_next_flush()')
+        rows=self.function_sample(workload)
+        parent=next(r for r in rows if r['funcname']=='parent')
+        child=self.worker_row(rows)
+        self.assertEqual(parent['calls_delta'],10)
+        self.assertEqual(child['calls_delta'],10)
+        self.assertGreater(parent['total_time_delta'],parent['self_time_delta'])
+        self.assertGreaterEqual(parent['total_time_delta'],child['total_time_delta'])
+
+    def test_tracking_and_new_statistics(self):
+        # Changing tracking in the sampler would not enable tracking in workers.
+        sql("SET track_functions='none'; SELECT delta_function_tests.untracked(); "
+            'SELECT pg_stat_force_next_flush()')
+        self.assertEqual(sql("SELECT count(*) FROM pg_stat_user_functions "
+                             "WHERE funcid='delta_function_tests.untracked()'::regprocedure"),'0')
+        before=sql(f'SELECT calls FROM pg_stat_user_functions WHERE funcid={self.worker}')
+        sql("SET track_functions='none'; SELECT delta_function_tests.worker(1); "
+            'SELECT pg_stat_force_next_flush()')
+        self.assertEqual(sql(f'SELECT calls FROM pg_stat_user_functions WHERE funcid={self.worker}'),before)
+        # Inlined SQL bodies have no separate tracked execution, even with all.
+        sql("SET track_functions='all'; SELECT delta_function_tests.inline_sql(i) "
+            'FROM generate_series(1,10) i; SELECT pg_stat_force_next_flush()')
+        self.assertEqual(sql("SELECT count(*) FROM pg_stat_user_functions "
+                             "WHERE funcid='delta_function_tests.inline_sql(integer)'::regprocedure"),'0')
+        def workload():
+            sql("SET track_functions='pl'; SELECT delta_function_tests.first_seen(); "
+                'SELECT pg_stat_force_next_flush()')
+        rows=self.function_sample(workload)
+        row=next(r for r in rows if r['funcname']=='first_seen')
+        self.assertEqual(row['status'],'missing')
+        for c in self.counters:self.assertIsNone(row[c+'_delta'])
+
+    def test_function_reset_and_catchup(self):
+        def reset():
+            sql(f'SELECT pg_stat_reset_single_function_counters({self.worker})')
+            self.workload(30)
+        rows=self.function_sample(reset)
+        for row in rows:
+            self.assertEqual(row['status'],'reset')
+            for c in self.counters:self.assertIsNone(row[c+'_delta'])
+
+    def test_database_reset(self):
+        def reset():
+            sql('SELECT pg_stat_reset()')
+            self.workload()
+        row=self.worker_row(self.function_sample(reset))
+        self.assertEqual(row['status'],'reset')
+        for c in self.counters:self.assertIsNone(row[c+'_delta'])
+
+    def test_alternative_plans(self):
+        for settings in [
+            'SET LOCAL enable_hashjoin=off; SET LOCAL join_collapse_limit=1; '
+            'SET LOCAL from_collapse_limit=1; ',
+            'SET LOCAL enable_mergejoin=off; SET LOCAL enable_nestloop=off; '
+            'SET LOCAL enable_material=off; ',
+        ]:
+            row=self.worker_row(self.function_sample(self.workload,
+                "BEGIN; SET LOCAL jit=off; SET LOCAL stats_fetch_consistency='snapshot'; "
+                +settings+'SELECT sum(calls) FROM pg_stat_user_functions; '))
+            self.assertEqual(row['status'],'ok')
+            self.assertEqual(row['calls_delta'],17)
+
+    def test_catalog_rename(self):
+        try:
+            rows=self.function_sample(lambda:sql('ALTER FUNCTION delta_function_tests.worker(integer) RENAME TO renamed'))
+            row=self.worker_row(rows)
+            self.assertEqual(row['funcname'],'worker')
+            self.assertEqual(sql(f"SELECT funcname FROM pg_stat_user_functions_delta(0) WHERE funcid={self.worker}"),'renamed')
+        finally:
+            sql('ALTER FUNCTION delta_function_tests.renamed(integer) RENAME TO worker')
+
+    def test_repeated_calls(self):
+        out=sql("BEGIN; SET LOCAL stats_fetch_consistency='snapshot'; "
+                'SELECT sum(calls) FROM pg_stat_user_functions; '
+                "SELECT bool_and(status='ok' AND elapsed_seconds>=0.05) FROM pg_stat_user_functions_delta(0.05); "
+                "SELECT bool_and(status='ok' AND elapsed_seconds>=0.05) FROM pg_stat_user_functions_delta(0.05); COMMIT;")
+        self.assertEqual(out.splitlines()[-3:],['t','t','COMMIT'])
+
+    def test_controlled_snapshots(self):
+        source=(Path(__file__).resolve().parents[1]/'sql/pg_stat_user_functions_delta.sql').read_text()
+        query=source.split('RETURN QUERY\n',1)[1].split('\nEND;',1)[0]
+        query=query.replace('i_delta_seconds::double precision','0::double precision').rstrip().rstrip(';')
+        def fixture(rows):
+            values=[]
+            for oid,counts in rows:
+                values.append(f"({oid}::oid,'fixture'::name,'overloaded'::name,{counts[0]}::bigint,"
+                              f"{counts[1]}::double precision,{counts[2]}::double precision)")
+            return ('FROM (VALUES '+','.join(values)+') AS f(funcid,schemaname,funcname,calls,total_time,self_time)')
+        def execute(before,after):
+            q=query.replace('FROM pg_stat_user_functions AS f',fixture(before),1)
+            q=q.replace('FROM pg_stat_user_functions AS f',fixture(after),1)
+            return json.loads(sql('SELECT json_agg(q) FROM ('+q+') q'))
+        rows=execute([(90001,[10,20,10]),(90002,[10,20,10])],
+                     [(90001,[15,30,15]),(90003,[15,30,15])])
+        self.assertEqual(len(rows),3)
+        for row in rows:
+            status='ok' if int(row['funcid'])==90001 else 'missing'
+            self.assertEqual(row['status'],status)
+            for c,v in zip(self.counters,[5,10,5]):
+                self.assertEqual(row[c+'_delta'],v if status=='ok' else None)
+        for i in range(3):
+            vals=[20,30,20];vals[i]=9
+            row,=execute([(90001,[10,10,10])],[(90001,vals)])
+            self.assertEqual(row['status'],'reset')
+            for c in self.counters:self.assertIsNone(row[c+'_delta'])
+
+
 class InvalidDeltaArithmeticTests(unittest.TestCase):
     def test_invalid_snapshots_skip_subtraction(self):
         # Invalid rows must not subtract counters at all: a bigint difference
@@ -1077,6 +1403,8 @@ class InvalidDeltaArithmeticTests(unittest.TestCase):
             ('pg_statio_user_tables', 't', 'heap_blks_hit', 'heap_blks_read', 'counter_decreased'),
             ('pg_statio_user_indexes', 'i', 'idx_blks_hit', 'idx_blks_read', 'counter_decreased'),
             ('pg_stat_wal', 'w', 'wal_fpi', 'wal_records', 'counter_decreased'),
+            ('pg_stat_io', 'i', 'writes', 'reads', 'counter_decreased'),
+            ('pg_stat_user_functions', 'f', 'calls', 'total_time', 'reset'),
         ]
         for view, alias, overflow, decrease, status in cases:
             with self.subTest(view=view):
@@ -1094,7 +1422,7 @@ class InvalidDeltaArithmeticTests(unittest.TestCase):
                             value = "'2026-01-02 UTC'" if second and decrease is None else "'2026-01-01 UTC'"
                         elif typ == 'oid':
                             value = '1'
-                        elif typ == 'name':
+                        elif typ in ['name', 'text']:
                             value = "'fixture'"
                         elif typ in ['bigint', 'integer', 'numeric', 'double precision']:
                             value = '0'
@@ -1119,7 +1447,7 @@ class InstallationTests(unittest.TestCase):
         name = 'delta_test_installation'
         functions = ['pg_stat_database_delta', 'pg_stat_user_tables_delta',
                      'pg_stat_user_indexes_delta', 'pg_statio_user_tables_delta',
-                     'pg_statio_user_indexes_delta', 'pg_stat_wal_delta']
+                     'pg_statio_user_indexes_delta', 'pg_stat_wal_delta', 'pg_stat_io_delta', 'pg_stat_user_functions_delta']
         sql(f'CREATE DATABASE {name}')
         try:
             self.assertEqual(sql("SELECT version FROM pg_available_extension_versions "
@@ -1133,18 +1461,18 @@ class InstallationTests(unittest.TestCase):
                                      PGDATABASE=name), '0.1.0')
                 for function in functions:
                     rows = sql(f'SELECT count(*) FROM {schema}.{function}(0)', PGDATABASE=name)
-                    if function in ['pg_stat_database_delta', 'pg_stat_wal_delta']:
+                    if function in ['pg_stat_database_delta', 'pg_stat_wal_delta', 'pg_stat_io_delta']:
                         self.assertGreater(int(rows), 0)
                     else:
                         self.assertEqual(rows, '0')
-                # All six functions must be extension members, not loose SQL objects.
+                # All eight functions must be extension members, not loose SQL objects.
                 self.assertEqual(sql("SELECT count(*) FROM pg_depend d "
                                      "JOIN pg_extension e ON e.oid=d.refobjid "
                                      "JOIN pg_proc p ON p.oid=d.objid "
                                      "WHERE e.extname='pg_stat_delta' AND d.deptype='e' "
                                      "AND d.classid='pg_proc'::regclass "
                                      "AND d.refclassid='pg_extension'::regclass",
-                                     PGDATABASE=name), '6')
+                                     PGDATABASE=name), '8')
                 start = time.monotonic()
                 sql(f'SELECT count(*) FROM {schema}.pg_statio_user_indexes_delta(0.1)', PGDATABASE=name)
                 self.assertGreaterEqual(time.monotonic() - start, .1)

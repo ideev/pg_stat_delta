@@ -1,6 +1,6 @@
 # Uniform snapshot ordering and delta guards
 
-All six version-0.1.0 functions now use the same explicit ordering dependency in
+All eight version-0.1.0 functions now use the same explicit ordering dependency in
 first_snapshot and second_snapshot:
 
 ```sql
@@ -39,9 +39,10 @@ confirmed expansion even with OFFSET 0.
 
 ## Validation
 
-All 60 methods in the complete integration suite passed on PostgreSQL 17.11
-(100.363 seconds). A new controlled-snapshot
-regression executes all six actual SQL queries with invalid statuses and raw
+The preceding six-function integration suite passed all 60 methods on PostgreSQL
+17.11 (100.363 seconds). The current eight-function suite adds I/O and function tests and has
+77 methods; see [I/O query](io-query.md) and [function query](function-query.md). The controlled-snapshot
+regression now executes all eight actual SQL queries with invalid statuses and raw
 bigint endpoints whose difference would overflow. Every delta must return NULL
 without evaluating that subtraction. Database missing/reset fixtures now also
 assert num_backends_delta is NULL. Concurrent tests cover none/cache/snapshot
@@ -50,8 +51,8 @@ object sets, and installation/schema relocation.
 
 ## Local plan and runtime comparison
 
-Measurements and verification results for the current revision are recorded
-below. Earlier per-function performance documents retain their historical
+Measurements and verification results for the preceding six-function revision
+are recorded below. The new I/O sampler is measured in [io-query.md](io-query.md). Earlier per-function performance documents retain their historical
 comparisons; their medians are not measurements of this revision.
 
 PostgreSQL 17.11 / Debian 13, isolated disposable database with 1,000 empty user

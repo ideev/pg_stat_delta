@@ -36,7 +36,7 @@ view can be reduced to a catalog-only plan and does not establish cached stats.
 
 ## Statistics query baselines
 
-All six samplers use the same pre-scan cache-clear dependency in both
+All eight samplers use the same pre-scan cache-clear dependency in both
 first_snapshot and second_snapshot:
 
 ```sql
@@ -58,7 +58,7 @@ start/end gauges remain available on invalid rows. Do not claim that ordinary
 CTEs or OFFSET 0 guarantee a single status evaluation: verify actual plans.
 Avoid extra per-object materialization solely to share a cheap status check.
 
-The five object samplers use flat snapshots and FULL OUTER JOIN by object OID.
+The six object samplers use flat snapshots and FULL OUTER JOIN by object OID.
 The database sampler compares source stats_reset. The four relation samplers
 read the database reset marker internally once per snapshot. A marker change
 invalidates all deltas, even if activity has already caught up. Table/index
@@ -68,6 +68,20 @@ All invalid statuses, including missing, invalidate every delta together.
 The WAL sampler reads one cluster-wide row from pg_stat_wal. Keep wal_bytes in
 native numeric and use the source reset marker. Any decrease or reset invalidates
 all eight deltas. No identity join or sort is needed.
+
+The cluster I/O sampler joins the complete (backend_type, object, context) key
+from pg_stat_io. Use its own stats_reset marker, preserve unsupported NULL
+metrics, and keep op_bytes as a size, not a delta or cumulative count. Any invalid
+status invalidates all thirteen deltas. This PG17 view does not cover all server
+I/O (notably WAL and temporary spill files). See docs/io-query.md.
+
+The function sampler joins pg_stat_user_functions by funcid, not function name
+(overloads share names). Retain the internal database reset-marker check: PG17
+single-function resets advance that marker. All three deltas are NULL for missing
+or reset, including caught-up counters. First statistics publication may create
+a missing row even without catalog DDL. Never set track_functions inside the
+sampler; workload sessions control tracking, and SQL inlining can bypass it.
+Times are milliseconds, not CPU time. See docs/function-query.md.
 
 See docs/uniform-snapshots.md for the current query policy and measurements.
 The per-function query documents retain earlier implementation comparisons.
