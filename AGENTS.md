@@ -36,7 +36,7 @@ view can be reduced to a catalog-only plan and does not establish cached stats.
 
 ## Statistics query baselines
 
-All eight samplers use the same pre-scan cache-clear dependency in both
+All thirteen samplers use the same pre-scan cache-clear dependency in both
 first_snapshot and second_snapshot:
 
 ```sql
@@ -58,7 +58,7 @@ start/end gauges remain available on invalid rows. Do not claim that ordinary
 CTEs or OFFSET 0 guarantee a single status evaluation: verify actual plans.
 Avoid extra per-object materialization solely to share a cheap status check.
 
-The six object samplers use flat snapshots and FULL OUTER JOIN by object OID.
+The seven object samplers use flat snapshots and FULL OUTER JOIN by object OID.
 The database sampler compares source stats_reset. The four relation samplers
 read the database reset marker internally once per snapshot. A marker change
 invalidates all deltas, even if activity has already caught up. Table/index
@@ -82,6 +82,32 @@ or reset, including caught-up counters. First statistics publication may create
 a missing row even without catalog DDL. Never set track_functions inside the
 sampler; workload sessions control tracking, and SQL inlining can bypass it.
 Times are milliseconds, not CPU time. See docs/function-query.md.
+
+The PostgreSQL 17 bgwriter sampler is a singleton with three bigint counters,
+not the pre-17 checkpoint/backends layout. Use its own stats_reset marker and
+invalidate all three deltas on reset or decrease. It needs no identity join or
+sort. Bgwriter publication is independent of client forced flushes: allow enough
+time in concurrent tests, and test real writer/limit activity only in a private
+cluster where buffer/writer settings may safely be changed. See docs/bgwriter-query.md.
+
+The checkpointer sampler is one PG17 cluster-wide row with six bigint counters
+and two millisecond timing counters. Use its own reset marker; never request a
+checkpoint from the sampler. SLRU pairs rows by name and uses each row's own
+stats_reset, so a targeted reset must not invalidate unrelated caches. Conflicts
+pair by database OID and add only pg_stat_get_db_stat_reset_time(datid) per source
+row: that view lacks a reset marker. Its counters concern recovery cancellations,
+not primary lock waits. All three use counter_decreased for non-marker decreases
+and invalidate every delta of an invalid row. Verify real recovery conflicts and
+restartpoints using only the private primary/standby helper. See the new
+checkpointer, SLRU and conflicts query documents.
+
+The archiver sampler is a singleton with two bigint deltas and four last-event
+fields from the second snapshot, suffixed _end. Keep the first snapshot limited
+to counters/reset marker. A reset or decrease invalidates both deltas but does
+not discard final event state. End timestamps can predate sampling, and failure
+counts can include retries for one filename. Never enable archiving, switch WAL
+or invoke archive commands from the sampler; real archive tests use only the
+private-cluster helper. See docs/archiver-query.md.
 
 See docs/uniform-snapshots.md for the current query policy and measurements.
 The per-function query documents retain earlier implementation comparisons.

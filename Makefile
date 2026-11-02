@@ -7,7 +7,12 @@ FUNCTION_SQL = sql/pg_stat_database_delta.sql \
                sql/pg_statio_user_indexes_delta.sql \
                sql/pg_stat_wal_delta.sql \
                sql/pg_stat_io_delta.sql \
-               sql/pg_stat_user_functions_delta.sql
+               sql/pg_stat_user_functions_delta.sql \
+               sql/pg_stat_bgwriter_delta.sql \
+               sql/pg_stat_checkpointer_delta.sql \
+               sql/pg_stat_slru_delta.sql \
+               sql/pg_stat_database_conflicts_delta.sql \
+               sql/pg_stat_archiver_delta.sql
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)

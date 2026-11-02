@@ -1,6 +1,6 @@
 # Uniform snapshot ordering and delta guards
 
-All eight version-0.1.0 functions now use the same explicit ordering dependency in
+All thirteen version-0.1.0 functions now use the same explicit ordering dependency in
 first_snapshot and second_snapshot:
 
 ```sql
@@ -15,9 +15,10 @@ snapshot. Clearing therefore precedes statistics getter evaluation, including
 getters in source-view aggregates or Function Scans. No snapshot relies on
 CROSS JOIN execution order to establish clearing.
 
-Five samplers still match object IDs with FULL OUTER JOIN. WAL remains a
-singleton CROSS JOIN. No new sort, window function or materialized object set is
-introduced. The snapshots and timing aggregates retain their existing roles.
+Seven samplers match object IDs with FULL OUTER JOIN. WAL, bgwriter,
+checkpointer and archiver use singleton CROSS JOINs; cluster I/O matches three text dimensions
+and SLRU matches cache names. No new
+sort, window function or materialized classification set is introduced. The snapshots and timing aggregates retain their existing roles.
 
 Every returned *_delta uses a status-ok CASE, with the subtraction inside that
 CASE. Raw endpoints are carried to the final projection rather than subtracting
@@ -40,9 +41,10 @@ confirmed expansion even with OFFSET 0.
 ## Validation
 
 The preceding six-function integration suite passed all 60 methods on PostgreSQL
-17.11 (100.363 seconds). The current eight-function suite adds I/O and function tests and has
-77 methods; see [I/O query](io-query.md) and [function query](function-query.md). The controlled-snapshot
-regression now executes all eight actual SQL queries with invalid statuses and raw
+17.11 (100.363 seconds). The current thirteen-function suite adds I/O, function, bgwriter, checkpointer,
+SLRU, conflict and archiver tests and has 108 methods; see [I/O query](io-query.md), [function query](function-query.md) and
+[bgwriter query](bgwriter-query.md). The controlled-snapshot
+regression now executes all thirteen actual SQL queries with invalid statuses and raw
 bigint endpoints whose difference would overflow. Every delta must return NULL
 without evaluating that subtraction. Database missing/reset fixtures now also
 assert num_backends_delta is NULL. Concurrent tests cover none/cache/snapshot
@@ -71,8 +73,8 @@ benchmark database; WAL returned one row. Other samplers returned 1,000 rows.
 | `pg_statio_user_indexes_delta` | 8.4945 | 8.7550 | 7.730–10.048 | 8.173–9.268 |
 | `pg_statio_user_tables_delta` | 19.4530 | 19.4585 | 18.540–22.887 | 19.178–25.866 |
 
-All twelve after-snapshot plans have a Limit node with a pre-scan InitPlan (two
-per function). No extra sort or WindowAgg was introduced. Per-function final sort
+All twelve snapshot nodes in the six revised queries measured above had a Limit
+node with a pre-scan InitPlan (two per function). No extra sort or WindowAgg was introduced. Per-function final sort
 space was unchanged: database 26 KB, table statistics 314 KB, index statistics
 298 KB, table I/O 267 KB, index I/O 282 KB; WAL has no sort. Shared buffer hits
 were unchanged within each before/after pair (5, 346, 6,346, 18,252, 6,346 and 0

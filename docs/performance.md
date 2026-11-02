@@ -4,7 +4,11 @@ The five object samplers in version 0.1.0 use flat native snapshots and FULL OUT
 JOIN. The new singleton WAL sampler uses a CROSS JOIN without sorting; see
 [WAL query](wal-query.md). The cluster I/O sampler joins three text dimensions;
 its plan and measurements are in [I/O query](io-query.md). Function-statistics
-plans at different tracked-row counts are in [function query](function-query.md). The comparisons below evaluate complete implementations, including compact
+plans at different tracked-row counts are in [function query](function-query.md).
+The singleton background-writer sampler is described in [bgwriter query](bgwriter-query.md).
+The new analyses cover [checkpointer](checkpointer-query.md), [SLRU](slru-query.md)
+and [database conflicts](conflicts-query.md). The singleton archiver with final
+event state is described in [archiver query](archiver-query.md). The comparisons below evaluate complete implementations, including compact
 result changes and correctness fixes, not isolated join algorithms.
 
 Current query ordering and guarded-subtraction changes are described in
@@ -40,6 +44,11 @@ Use a representative disposable database and standard PGHOST, PGPORT, PGDATABASE
 and PGUSER settings, optionally PSQL to select a client:
 
 ```sh
+python3 tests/explain_statistics.py --view archiver
+python3 tests/explain_statistics.py --view checkpointer
+python3 tests/explain_statistics.py --view slru
+python3 tests/explain_statistics.py --view database_conflicts
+python3 tests/explain_statistics.py --view bgwriter
 python3 tests/explain_statistics.py --view functions
 python3 tests/explain_statistics.py --view io
 python3 tests/explain_statistics.py --view wal

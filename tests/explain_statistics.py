@@ -9,11 +9,11 @@ from pathlib import Path
 import subprocess
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--view', choices=['database', 'wal', 'io', 'tables', 'indexes', 'functions', 'statio_user_tables', 'statio_user_indexes'], default='tables')
+parser.add_argument('--view', choices=['database', 'wal', 'io', 'bgwriter', 'archiver', 'checkpointer', 'slru', 'database_conflicts', 'tables', 'indexes', 'functions', 'statio_user_tables', 'statio_user_indexes'], default='tables')
 parser.add_argument('--source', type=Path, help='Optional per-function SQL file, e.g. a previous revision')
 args = parser.parse_args()
 filename = ('pg_stat_database_delta.sql' if args.view == 'database'
-            else f'pg_stat_{args.view}_delta.sql' if args.view in ['wal', 'io']
+            else f'pg_stat_{args.view}_delta.sql' if args.view in ['wal', 'io', 'bgwriter', 'archiver', 'checkpointer', 'slru', 'database_conflicts']
             else f'pg_{args.view}_delta.sql' if args.view.startswith('statio_')
             else f'pg_stat_user_{args.view}_delta.sql')
 source_path = args.source or Path(__file__).resolve().parents[1] / 'sql' / filename

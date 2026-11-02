@@ -4,7 +4,9 @@ On-demand PostgreSQL statistics deltas, without snapshot tables or background
 workers. Version 0.1.0 provides `pg_stat_database_delta`,
 `pg_stat_user_tables_delta`, `pg_stat_user_indexes_delta`,
 `pg_statio_user_tables_delta`, `pg_statio_user_indexes_delta`, `pg_stat_wal_delta`,
-`pg_stat_io_delta`, and `pg_stat_user_functions_delta`.
+`pg_stat_io_delta`, `pg_stat_user_functions_delta`, `pg_stat_bgwriter_delta`,
+`pg_stat_checkpointer_delta`, `pg_stat_slru_delta`, `pg_stat_database_conflicts_delta`,
+and `pg_stat_archiver_delta`.
 Each accepts `i_delta_seconds numeric DEFAULT 5`.
 Implemented in PL/pgSQL; currently tested on **PostgreSQL 17.11**.
 
@@ -20,10 +22,15 @@ Implemented in PL/pgSQL; currently tested on **PostgreSQL 17.11**.
 | `pg_stat_wal_delta` | `pg_stat_wal` | One cluster-wide row |
 | `pg_stat_io_delta` | `pg_stat_io` | `(backend_type, object, context)` |
 | `pg_stat_user_functions_delta` | `pg_stat_user_functions` | `funcid` |
+| `pg_stat_bgwriter_delta` | `pg_stat_bgwriter` | One cluster-wide row |
+| `pg_stat_checkpointer_delta` | `pg_stat_checkpointer` | One cluster-wide row |
+| `pg_stat_slru_delta` | `pg_stat_slru` | `name` |
+| `pg_stat_database_conflicts_delta` | `pg_stat_database_conflicts` | `datid` |
+| `pg_stat_archiver_delta` | `pg_stat_archiver` | One cluster-wide row |
 
 Each call reads two flat snapshots in one SQL query, waits between them, clears
 the statistics cache for each read, and matches object rows with FULL OUTER JOIN.
-WAL uses a singleton CROSS JOIN. All functions return `sampled_at_start`, `sampled_at_end`, `elapsed_seconds` and
+WAL, background-writer, checkpointer and archiver sampling use singleton CROSS JOINs. All functions return `sampled_at_start`, `sampled_at_end`, `elapsed_seconds` and
 `status`. Cumulative differences use `_delta`; state estimates and last-event
 timestamps are separate values. Database scope includes its shared-object row;
 the four relation samplers and function sampler follow their source views in the
@@ -33,12 +40,12 @@ current database.
 | --- | --- | --- |
 | `ok` | No discontinuity detected; source NULLs remain NULL | All functions |
 | `reset` | A reset marker changed; table/index/function statistics also use this for counter decreases | All functions |
-| `counter_decreased` | An I/O or WAL counter decreased without a changed reset marker | Both relation-I/O functions, WAL and `pg_stat_io_delta` |
+| `counter_decreased` | A counter decreased without a changed reset marker | Relation I/O, WAL, cluster I/O, bgwriter, checkpointer, SLRU, conflicts and archiver |
 | `missing` | An identity exists in only one sampled row set | Row-set samplers, including `pg_stat_io_delta` |
 
 **Every delta is NULL for a non-ok row**, including `num_backends_delta`.
 Connection start/end counts, table state estimates and last-event times can remain
-available where a snapshot exists. All eight functions clear caches before each
+available where a snapshot exists. All thirteen functions clear caches before each
 snapshot using `OFFSET (SELECT count(*) - 1 FROM initial_clear)` and the matching
 `second_clear` dependency. Each subtraction occurs inside `CASE WHEN status =
 'ok' THEN end_value - start_value END`; invalid rows never subtract counters.
@@ -103,7 +110,7 @@ SELECT * FROM pg_stat_database_delta(1.5);    -- fractional seconds are supporte
 
 During development all functions remain in **version 0.1.0**. New functions do
 not introduce additional extension versions or upgrade scripts. The complete
-`sql/pg_stat_delta--0.1.0.sql` is built from the eight named per-function SQL source
+`sql/pg_stat_delta--0.1.0.sql` is built from the thirteen named per-function SQL source
 files and kept in the repository for direct review. Run make after editing a
 function; make install also rebuilds the installation script when necessary.
 
@@ -131,7 +138,7 @@ The database function uses one SQL query with two materialized, **flat**
 for further database-query optimization. It avoids composite-record field access,
 `UNION ALL` and window functions. The table and index samplers also use full joins,
 as described below.
-The six object samplers use flat snapshots and FULL OUTER JOIN. All eight
+The seven object samplers use flat snapshots and FULL OUTER JOIN. All thirteen
 samplers, including WAL, retain explicit pre-scan cache-clear OFFSET barriers.
 
 `pg_stat_clear_snapshot()` runs for each read through the singleton clear CTE,
@@ -551,7 +558,7 @@ cache-clear dependencies, FULL OUTER JOIN on the complete key, and status-ok
 CASEs containing each subtraction. No JSON, snapshot tables, or additional
 materialized classification set is used. See [I/O query analysis](docs/io-query.md).
 Only PostgreSQL 17.11 has been verified; later pg_stat_io layouts are not claimed
-compatible. All eight functions remain in version 0.1.0.
+compatible. All thirteen functions remain in version 0.1.0.
 
 ## Function statistics
 
@@ -608,18 +615,213 @@ status-ok guarded subtraction follow the common policy. No JSON or persistent
 snapshots are used. See [function query analysis](docs/function-query.md).
 Version remains 0.1.0; only PostgreSQL 17.11 is verified.
 
+## Background-writer statistics
+
+```sql
+SELECT * FROM pg_stat_bgwriter_delta(1);
+```
+
+The source is PostgreSQL 17 `pg_stat_bgwriter`, one row for the **whole cluster**.
+Along with the four common timing/status columns it returns:
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `buffers_clean_delta` | bigint | Buffers written by the background writer |
+| `maxwritten_clean_delta` | bigint | Times the writer stopped a cleaning scan after reaching its write limit |
+| `buffers_alloc_delta` | bigint | Shared-buffer allocations, not physical reads or new memory allocation |
+
+PostgreSQL 17 moved checkpoint statistics into `pg_stat_checkpointer`. They are
+not included here, and older pg_stat_bgwriter layouts are not claimed supported.
+Allocation, writing, and limit-hit counts describe different events; do not sum
+them as I/O bytes. A limit hit is not a write error. Zero writes can reflect the
+writer's settings or workload, as well as publication delays.
+
+A changed source `stats_reset` produces `reset`; any decreased counter without
+a changed marker produces `counter_decreased`. Both invalidate **all three**
+deltas. Matching NULL markers are accepted. There is no missing-object status,
+identity join or sort. Both snapshots retain the common pre-scan OFFSET clear
+dependency, and every difference is computed only in its status-ok CASE.
+
+The marker belongs to `pg_stat_bgwriter`, not the current database.
+`pg_stat_reset_shared('bgwriter')` resets this cluster-wide statistics set;
+database, WAL and I/O resets do not by themselves invalidate it. The sampler
+neither changes writer settings nor forces a checkpoint. Background-writer publication is
+asynchronous, including idle/hibernation effects; `pg_stat_force_next_flush()`
+in a client backend cannot force the background writer to publish. Very short
+intervals can therefore return zero even when activity occurred.
+
+The optional real-write check uses only a private temporary cluster with a small
+buffer pool and aggressive writer settings:
+
+```sh
+python3 tests/check_bgwriter_workload.py --pg-bindir /path/to/postgresql/17/bin
+```
+
+It verifies positive deltas for all three counters and removes its own cluster.
+Existing servers and their settings are untouched. See
+[bgwriter query analysis](docs/bgwriter-query.md). Version remains 0.1.0.
+
+## Checkpointer statistics
+
+```sql
+SELECT * FROM pg_stat_checkpointer_delta(1);
+```
+
+This PostgreSQL 17 source is one row for the **whole cluster**. The four common
+timing/status fields are followed by:
+
+| Columns | Type | Meaning |
+| --- | --- | --- |
+| `num_timed_delta`, `num_requested_delta` | bigint | Timed and requested checkpoints |
+| `restartpoints_timed_delta`, `restartpoints_req_delta` | bigint | Timed and requested restartpoints |
+| `restartpoints_done_delta` | bigint | Restartpoints actually performed |
+| `write_time_delta`, `sync_time_delta` | double precision | Writing and synchronization phase time differences, milliseconds |
+| `buffers_written_delta` | bigint | Buffers written by the checkpointer |
+
+A requested restartpoint need not be performed. Restartpoints concern recovery;
+a primary normally has zero restartpoint activity. Writing-phase time includes
+checkpoint pacing and is not a physical-device latency measurement. These counts
+are separate from background-writer statistics.
+
+Changed source `stats_reset` produces `reset`; any decreased metric produces
+`counter_decreased`. Either makes all eight deltas NULL. There is no missing-row
+status, identity join or final sort. `pg_stat_reset_shared('checkpointer')` resets
+this statistics set; a bgwriter reset alone does not invalidate it. The sampler
+does not request checkpoints or restartpoints; tests explicitly do so in isolated
+test environments. See [checkpointer analysis](docs/checkpointer-query.md).
+
+## SLRU statistics
+
+```sql
+SELECT * FROM pg_stat_slru_delta(1);
+```
+
+This samples cluster-wide `pg_stat_slru` rows, keyed and ordered by `name text`.
+It returns that name, the common timing/status fields, and seven bigint deltas:
+`blks_zeroed_delta`, `blks_hit_delta`, `blks_read_delta`, `blks_written_delta`,
+`blks_exists_delta`, `flushes_delta`, `truncates_delta`.
+
+These are counts of SLRU events, not relation-buffer I/O. Existence checks,
+flushes and truncations are distinct operations; flushes are not a device-fsync
+count. No byte totals are derived. Reads may still be served by the OS cache.
+
+Each row's own `stats_reset` validates its pair of snapshots. A marker change
+means `reset`, a decrease means `counter_decreased`, and a name in just one
+snapshot means `missing`. Every invalid row has all seven deltas NULL.
+`pg_stat_reset_slru('transaction')` resets just that PG17 cache; a NULL argument
+resets all SLRU caches. Other rows remain valid on a targeted reset. Names are
+preserved from the source, without a hard-coded list; names/layouts in other
+PostgreSQL versions are unverified. See [SLRU analysis](docs/slru-query.md).
+
+## Recovery conflicts by database
+
+```sql
+SELECT * FROM pg_stat_database_conflicts_delta(1);
+```
+
+Rows match and sort by `datid oid`, include `datname name` and the common timing/
+status columns, and return six bigint deltas: `confl_tablespace_delta`,
+`confl_lock_delta`, `confl_snapshot_delta`, `confl_bufferpin_delta`,
+`confl_deadlock_delta`, `confl_active_logicalslot_delta`.
+
+These are **recovery conflicts**, normally accumulated on a standby, not ordinary
+primary lock waits, application deadlocks, serialization failures, or query errors.
+Primary activity normally produces zero. The source covers database catalog rows,
+without the shared-object datid=0 row from pg_stat_database.
+
+The source has no reset timestamp. Each snapshot adds only
+`pg_stat_get_db_stat_reset_time(datid)` for that row, avoiding another statistics
+view scan and keeping the marker internal. A changed marker gives `reset`, any
+counter decrease gives `counter_decreased`, and a database in only one snapshot
+gives `missing`. All six deltas are NULL for any invalid status. Database resets,
+including ones triggered by individual relation/function resets in PostgreSQL 17,
+can conservatively invalidate conflicts even when their values did not change.
+Matching NULL markers are accepted. Catalog DDL still follows one statement's
+MVCC snapshot; missing is defensive, not live database discovery.
+
+[The private primary/standby test](tests/check_recovery_conflicts.py) actually
+cancels standby queries through replayed exclusive locks in all three cache modes,
+then verifies a requested/performed restartpoint. It creates only private
+Unix-socket servers and removes both on completion:
+
+```sh
+python3 tests/check_recovery_conflicts.py --pg-bindir /path/to/postgresql/17/bin
+```
+
+See [conflict analysis](docs/conflicts-query.md). All three new samplers use the
+common zero-OFFSET clear dependencies, native flat snapshots, guarded subtraction
+and asynchronous publication semantics. They remain in version 0.1.0 and are
+verified on PostgreSQL 17.11 only.
+
+## Archiver statistics
+
+```sql
+SELECT * FROM pg_stat_archiver_delta(1);
+```
+
+The source is `pg_stat_archiver`, one row for the **whole cluster**, even when
+archiving is disabled. Along with the four common timing/status fields, the
+result returns:
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `archived_count_delta` | bigint | Successful archiving count difference |
+| `failed_count_delta` | bigint | Failed archiving attempt count difference |
+| `last_archived_wal_end` | text | Last successfully archived WAL filename at the second read |
+| `last_archived_time_end` | timestamptz | That success's reported timestamp |
+| `last_failed_wal_end` | text | Last WAL filename whose archiving failed at the second read |
+| `last_failed_time_end` | timestamptz | That failure's reported timestamp |
+
+Repeated failed attempts for the same file can increment `failed_count` more than
+once. Some archiver process/command errors are not counted by PostgreSQL in this
+view; the delta is not an exhaustive server-error count. Success means the
+configured archive mechanism reported success, not a verification of backup
+completeness or recoverability. Do not infer byte totals, LSN distance or newest
+available WAL from the last filename.
+
+The four `_end` values are **state**, not deltas or events guaranteed to have
+occurred inside the sample. They can predate the interval and remain non-NULL
+when count differences are zero. Source NULLs remain NULL. They are returned
+from the second snapshot even for an invalid measurement, and are not invented
+from the sampling timestamps.
+
+A changed source `stats_reset` means `reset`; either count decreasing without
+that change means `counter_decreased`. Both make **both deltas NULL** while
+retaining the final event state. Matching NULL markers are accepted. There is
+no missing-row status, identity join or sort. `pg_stat_reset_shared('archiver')`
+resets these statistics, not the archive files. Other statistics resets do not
+by themselves invalidate archiver deltas.
+
+The first snapshot keeps only the two counters and marker; the second also
+keeps last-event fields. Both use explicit pre-scan OFFSET clear dependencies.
+The function does not change archive settings, switch WAL, execute archive
+commands or inspect archive files. Publication is asynchronous; a client forced
+flush cannot make another process report. Disabled/no-activity archiving can
+return zero, which is not a diagnosis of configuration or archive health.
+
+The optional private-cluster test exercises real successful archive copies,
+command exit-code-1 failures and reset followed by success:
+
+```sh
+python3 tests/check_archiver_workload.py --pg-bindir /path/to/postgresql/17/bin
+```
+
+Only that temporary Unix-socket cluster has archive settings changed, and it is
+removed afterward. See [archiver analysis](docs/archiver-query.md). The new
+function remains version 0.1.0 and is verified on PostgreSQL 17.11.
+
 ## Integration tests
 
-The suite currently contains **77 integration test methods**; some exercise
+The suite currently contains **108 integration test methods**; some exercise
 multiple cache modes or edge cases. The complete suite passed on PostgreSQL 17.11
-with the current eight-function implementation. The optional private-cluster cold
+with the current thirteen-function implementation. The optional private-cluster cold
 block-read check also passed.
 
 Tests require Python 3, `psql`, and a running PostgreSQL 17 server. Use a
 **disposable test database and cluster**: tests reset database and cluster-wide
-WAL and I/O statistics, create and drop databases, tables and a role, and temporarily move
+WAL, I/O, bgwriter, checkpointer, SLRU and archiver statistics, create and drop databases, tables and a role, and temporarily move
 the extension between schemas.
-Tests require the current 0.1.0 files and all eight functions loaded in the
+Tests require the current 0.1.0 files and all thirteen functions loaded in the
 selected test database.
 The connection needs administrative privileges. No Python packages are required.
 Cache tests explicitly read sum() of a statistic before sampling (for example,
@@ -645,18 +847,28 @@ hits, NULL components, user-only scope, resets, DDL and cache modes. Index I/O
 tests also distinguish indexes of the same table. WAL tests cover real inserts in
 all three cache modes, alternate plans, shared WAL reset followed by new activity,
 native numeric bytes, and each individual counter decreasing. A controlled-snapshot
-regression checks all eight queries with invalid rows whose bigint subtraction
+regression checks all thirteen queries with invalid rows whose bigint subtraction
 would overflow: every delta must be NULL without an arithmetic error. Cluster I/O
 tests cover all three key dimensions, each counter decreasing, inapplicable NULL
 metrics, cache modes, normal and temporary relations, shared I/O resets, repeated
-calls and alternate plans. Function tests cover exact calls in three cache modes,
+calls and alternate plans. Bgwriter tests cover actual allocations, three cache
+modes, shared resets and independence from unrelated resets, repeated calls,
+alternate plans, native bigint precision and each counter decreasing. Function tests cover exact calls in three cache modes,
 overloads, nested inclusive/self timing, disabled tracking, SQL inlining, first
 statistics publication, reset/catch-up, database reset, catalog rename, repeated
 calls and alternate plans. The private-cluster check also verifies positive read
-counts and measured read time with track_io_timing enabled. Installation tests
+counts and measured read time with track_io_timing enabled. Checkpointer tests
+exercise explicit checkpoints and marker independence. SLRU tests cover real
+transaction activity, targeted/global resets and stable names. Conflict tests
+cover primary zeros, database resets and controlled missing/decreasing rows; the
+optional primary/standby helper covers actual recovery cancellations and
+restartpoints. Archiver tests cover cached and unrelated resets, repeated calls,
+end-event state (including stale/NULL values), bigint precision and both individual
+counter decreases. A private archive-mode cluster checks actual copies, failed
+commands and reset followed by success. Installation tests
 verify that
 only 0.1.0 is available, both default and explicit version selection install all
-eight extension members, and extension removal cleans up those functions. These
+thirteen extension members, and extension removal cleans up those functions. These
 checks include another schema and empty user-table/index sets in a separate
 disposable database. Sampling tests wait until the measurement connection enters
 `pg_sleep` before generating activity.
