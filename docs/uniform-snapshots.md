@@ -1,6 +1,6 @@
 # Uniform snapshot ordering and delta guards
 
-All thirteen version-0.1.0 functions now use the same explicit ordering dependency in
+All fourteen version-0.1.0 functions now use the same explicit ordering dependency in
 first_snapshot and second_snapshot:
 
 ```sql
@@ -17,8 +17,9 @@ CROSS JOIN execution order to establish clearing.
 
 Seven samplers match object IDs with FULL OUTER JOIN. WAL, bgwriter,
 checkpointer and archiver use singleton CROSS JOINs; cluster I/O matches three text dimensions
-and SLRU matches cache names. No new
-sort, window function or materialized classification set is introduced. The snapshots and timing aggregates retain their existing roles.
+and SLRU matches cache names. The optional statement sampler pairs its four-part key and deliberately
+materializes its expensive classifier; see [statement analysis](statements-query.md).
+The other samplers introduce no additional materialized classification set. The snapshots and timing aggregates retain their existing roles.
 
 Every returned *_delta uses a status-ok CASE, with the subtraction inside that
 CASE. Raw endpoints are carried to the final projection rather than subtracting
@@ -34,17 +35,18 @@ CREATE OR REPLACE FUNCTION can apply these body-only changes. Version stays 0.1.
 
 An ordinary naming CTE does not guarantee a single status evaluation. The former
 OFFSET 0 expressions and comments claiming that guarantee were removed. Plans may
-expand the status expression into each CASE; this is accepted without adding
-another materialized set of all monitored objects. The prior WAL comparison
+expand the status expression into each CASE; for the smaller classifiers this
+is accepted without another materialized set of monitored objects. The statement
+sampler is the measured exception for its expensive 34-metric check. The prior WAL comparison
 confirmed expansion even with OFFSET 0.
 
 ## Validation
 
 The preceding six-function integration suite passed all 60 methods on PostgreSQL
-17.11 (100.363 seconds). The current thirteen-function suite adds I/O, function, bgwriter, checkpointer,
-SLRU, conflict and archiver tests and has 108 methods; see [I/O query](io-query.md), [function query](function-query.md) and
+17.11 (100.363 seconds). The current core suite has 109 methods for fourteen installed functions; the
+optional statement helper adds 19 methods in a separate preloaded cluster; see [I/O query](io-query.md), [function query](function-query.md) and
 [bgwriter query](bgwriter-query.md). The controlled-snapshot
-regression now executes all thirteen actual SQL queries with invalid statuses and raw
+core regression executes the thirteen native-statistics SQL queries with invalid statuses and raw
 bigint endpoints whose difference would overflow. Every delta must return NULL
 without evaluating that subtraction. Database missing/reset fixtures now also
 assert num_backends_delta is NULL. Concurrent tests cover none/cache/snapshot

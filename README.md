@@ -6,7 +6,7 @@ workers. Version 0.1.0 provides `pg_stat_database_delta`,
 `pg_statio_user_tables_delta`, `pg_statio_user_indexes_delta`, `pg_stat_wal_delta`,
 `pg_stat_io_delta`, `pg_stat_user_functions_delta`, `pg_stat_bgwriter_delta`,
 `pg_stat_checkpointer_delta`, `pg_stat_slru_delta`, `pg_stat_database_conflicts_delta`,
-and `pg_stat_archiver_delta`.
+`pg_stat_archiver_delta`, and optional `pg_stat_statements_delta`.
 Each accepts `i_delta_seconds numeric DEFAULT 5`.
 Implemented in PL/pgSQL; currently tested on **PostgreSQL 17.11**.
 
@@ -27,6 +27,7 @@ Implemented in PL/pgSQL; currently tested on **PostgreSQL 17.11**.
 | `pg_stat_slru_delta` | `pg_stat_slru` | `name` |
 | `pg_stat_database_conflicts_delta` | `pg_stat_database_conflicts` | `datid` |
 | `pg_stat_archiver_delta` | `pg_stat_archiver` | One cluster-wide row |
+| `pg_stat_statements_delta` | `pg_stat_statements` 1.11 | `(userid, dbid, toplevel, queryid)` |
 
 Each call reads two flat snapshots in one SQL query, waits between them, clears
 the statistics cache for each read, and matches object rows with FULL OUTER JOIN.
@@ -40,12 +41,12 @@ current database.
 | --- | --- | --- |
 | `ok` | No discontinuity detected; source NULLs remain NULL | All functions |
 | `reset` | A reset marker changed; table/index/function statistics also use this for counter decreases | All functions |
-| `counter_decreased` | A counter decreased without a changed reset marker | Relation I/O, WAL, cluster I/O, bgwriter, checkpointer, SLRU, conflicts and archiver |
+| `counter_decreased` | A counter decreased without a changed reset marker | Relation I/O, WAL, cluster I/O, bgwriter, checkpointer, SLRU, conflicts, archiver and statements |
 | `missing` | An identity exists in only one sampled row set | Row-set samplers, including `pg_stat_io_delta` |
 
 **Every delta is NULL for a non-ok row**, including `num_backends_delta`.
 Connection start/end counts, table state estimates and last-event times can remain
-available where a snapshot exists. All thirteen functions clear caches before each
+available where a snapshot exists. All fourteen functions clear caches before each
 snapshot using `OFFSET (SELECT count(*) - 1 FROM initial_clear)` and the matching
 `second_clear` dependency. Each subtraction occurs inside `CASE WHEN status =
 'ok' THEN end_value - start_value END`; invalid rows never subtract counters.
@@ -110,7 +111,7 @@ SELECT * FROM pg_stat_database_delta(1.5);    -- fractional seconds are supporte
 
 During development all functions remain in **version 0.1.0**. New functions do
 not introduce additional extension versions or upgrade scripts. The complete
-`sql/pg_stat_delta--0.1.0.sql` is built from the thirteen named per-function SQL source
+`sql/pg_stat_delta--0.1.0.sql` is built from the fourteen named per-function SQL source
 files and kept in the repository for direct review. Run make after editing a
 function; make install also rebuilds the installation script when necessary.
 
@@ -138,7 +139,7 @@ The database function uses one SQL query with two materialized, **flat**
 for further database-query optimization. It avoids composite-record field access,
 `UNION ALL` and window functions. The table and index samplers also use full joins,
 as described below.
-The seven object samplers use flat snapshots and FULL OUTER JOIN. All thirteen
+The seven object samplers use flat snapshots and FULL OUTER JOIN. All fourteen
 samplers, including WAL, retain explicit pre-scan cache-clear OFFSET barriers.
 
 `pg_stat_clear_snapshot()` runs for each read through the singleton clear CTE,
@@ -558,7 +559,7 @@ cache-clear dependencies, FULL OUTER JOIN on the complete key, and status-ok
 CASEs containing each subtraction. No JSON, snapshot tables, or additional
 materialized classification set is used. See [I/O query analysis](docs/io-query.md).
 Only PostgreSQL 17.11 has been verified; later pg_stat_io layouts are not claimed
-compatible. All thirteen functions remain in version 0.1.0.
+compatible. All fourteen functions remain in version 0.1.0.
 
 ## Function statistics
 
@@ -810,19 +811,118 @@ Only that temporary Unix-socket cluster has archive settings changed, and it is
 removed afterward. See [archiver analysis](docs/archiver-query.md). The new
 function remains version 0.1.0 and is verified on PostgreSQL 17.11.
 
+## Statement statistics (optional dependency)
+
+```sql
+-- Configure shared_preload_libraries to include pg_stat_statements and restart
+-- PostgreSQL when first enabling it. Install its SQL objects in this database:
+CREATE EXTENSION pg_stat_statements; -- version 1.11 on the tested PostgreSQL 17
+SELECT * FROM pg_stat_statements_delta(1);
+```
+
+The core extension remains installable and usable **without** pg_stat_statements.
+Only this optional function requires it: an absent installation gives a clear
+error, an installed library without preload produces its native preload error,
+and SQL extension versions other than **1.11** are explicitly rejected. The
+sampler never enables preload, installs/upgrades pg_stat_statements, restarts a
+server, resets counters, or changes tracking settings.
+
+The source is cluster-wide shared statement statistics, not only statements in
+the database where this function is installed. The complete key is
+`userid oid`, `dbid oid`, `toplevel boolean`, `queryid bigint`. The result contains
+those fields, `query text` from the second read, common timing/status columns,
+and **34 additive deltas**:
+
+| Metric families (each suffixed `_delta`) | Types/units |
+| --- | --- |
+| `plans`, `total_plan_time` | bigint count; double precision milliseconds |
+| `calls`, `total_exec_time`, `rows` | bigint counts; double precision milliseconds |
+| `shared_blks_hit/read/dirtied/written` | bigint counts |
+| `local_blks_hit/read/dirtied/written` | bigint counts |
+| `temp_blks_read/written` | bigint counts |
+| `shared_blk_read_time/write_time`, `local_blk_read_time/write_time`, `temp_blk_read_time/write_time` | double precision milliseconds |
+| `wal_records`, `wal_fpi`, `wal_bytes` | bigint counts; native numeric bytes |
+| `jit_functions`, `jit_generation_time` | bigint count; double precision milliseconds |
+| `jit_inlining_count/time`, `jit_optimization_count/time`, `jit_emission_count/time`, `jit_deform_count/time` | bigint counts; double precision milliseconds |
+
+Min/max/mean/stddev fields are not cumulative and are deliberately not subtracted.
+No averages, byte conversions or rates are added. Planning metrics depend on
+`pg_stat_statements.track_planning`; disabled planning can yield positive calls
+with zero plan deltas. I/O times depend on track_io_timing, and JIT metrics depend
+on whether JIT actually ran. Plans need not equal calls. `rows_delta` is the
+source's returned/affected-row count, not a table's scanned-tuple count. All times
+are elapsed statistics, not server CPU time.
+
+Rows pair on all four key fields. The internal **per-entry `stats_since`** marker
+catches selective/full resets and eviction followed by reentry of the same key,
+even when new counts already caught up. A changed marker yields `reset`, any
+additive metric decreasing yields `counter_decreased`, and a key in only one
+snapshot yields `missing`. All 34 deltas are NULL for any invalid status.
+Min/max-only resets do not invalidate additive deltas; ordinary database stats
+resets do not replace this extension's per-entry marker.
+
+A new statement without a first snapshot is missing, not a delta from an invented
+zero. Seed important statements before sampling if they need a comparable
+baseline. For a disappeared entry, `query` is NULL because first-snapshot text is
+intentionally not loaded. Query IDs/normalization have the source's lifetime and
+collision limitations; the text is representative, not necessarily the exact
+statement or parameters executed during the interval.
+
+Schema discovery uses pg_extension on every call and quotes its namespace.
+Non-public/moved schemas are supported without changing the fixed search_path.
+The interval remains a bound parameter. Rights are SECURITY INVOKER: callers
+see source-authorized query IDs/text, typically their own statements or all
+statements with pg_read_all_stats. Rows with hidden NULL query IDs are omitted,
+since they cannot safely be matched; zero query IDs remain valid. Required schema
+USAGE and source EXECUTE rights are not bypassed or granted by this function.
+
+The source view calls pg_stat_statements(true). This sampler uses that same
+extension getter with **false** for the first snapshot and **true** for the second,
+loading representative query text only once. Both native snapshots retain the
+common pre-scan OFFSET clear dependencies. pg_stat_statements reads its own shared
+state; clearing core statistics caches does not force completion/reporting of
+in-flight statements. Planning can be recorded before execution completes, and
+calls completed during the sample may have started earlier. Monitoring queries
+can themselves appear when tracking permits them.
+
+Unlike the cheaper classifiers in other samplers, this 34-metric check is
+materialized once before delta projection. Measured native endpoints are kept
+without JSON. Local comparison at about 5,000 entries favored this over repeated
+checks or extra joins, **but it wrote temporary blocks at default work_mem**.
+Large entry sets/query texts can therefore impose meaningful CPU, memory and I/O
+overhead. No universal speedup or memory bound is claimed. See the measured
+tradeoffs and reproduction commands in [statement analysis](docs/statements-query.md).
+
+Run the dedicated private-cluster functional tests or benchmark:
+
+```sh
+python3 tests/check_statements_workload.py --pg-bindir /path/to/postgresql/17/bin
+python3 tests/check_statements_workload.py --pg-bindir /path/to/postgresql/17/bin --benchmark-only
+python3 tests/explain_statistics.py --view statements
+```
+
+Only the helper's private Unix-socket server is configured/restarted. The main
+server and its preload list are untouched. All fourteen functions stay version
+0.1.0; only PostgreSQL 17.11 with pg_stat_statements 1.11 is verified.
+
 ## Integration tests
 
-The suite currently contains **108 integration test methods**; some exercise
-multiple cache modes or edge cases. The complete suite passed on PostgreSQL 17.11
-with the current thirteen-function implementation. The optional private-cluster cold
+The core suite currently contains **109 integration test methods**; some exercise
+multiple cache modes or edge cases. It passed on PostgreSQL 17.11 with all
+fourteen functions installed and the optional statement dependency absent.
+The dedicated pg_stat_statements helper runs **19 additional test methods** in a
+separate preloaded cluster. The optional private-cluster cold
 block-read check also passed.
 
 Tests require Python 3, `psql`, and a running PostgreSQL 17 server. Use a
 **disposable test database and cluster**: tests reset database and cluster-wide
 WAL, I/O, bgwriter, checkpointer, SLRU and archiver statistics, create and drop databases, tables and a role, and temporarily move
 the extension between schemas.
-Tests require the current 0.1.0 files and all thirteen functions loaded in the
-selected test database.
+Tests require the current 0.1.0 files and all fourteen functions loaded in the
+selected test database. The core installation check expects pg_stat_statements
+to be absent in its fresh databases and verifies the optional dependency error.
+The separate statement suite exercises the active dependency and privileged/
+ordinary callers, and is not part of the default core test command.
 The connection needs administrative privileges. No Python packages are required.
 Cache tests explicitly read sum() of a statistic before sampling (for example,
 sum(idx_blks_hit)); count(*) can be optimized to read only catalog identities
@@ -847,7 +947,7 @@ hits, NULL components, user-only scope, resets, DDL and cache modes. Index I/O
 tests also distinguish indexes of the same table. WAL tests cover real inserts in
 all three cache modes, alternate plans, shared WAL reset followed by new activity,
 native numeric bytes, and each individual counter decreasing. A controlled-snapshot
-regression checks all thirteen queries with invalid rows whose bigint subtraction
+core regression checks all thirteen native-statistics queries with invalid rows whose bigint subtraction
 would overflow: every delta must be NULL without an arithmetic error. Cluster I/O
 tests cover all three key dimensions, each counter decreasing, inapplicable NULL
 metrics, cache modes, normal and temporary relations, shared I/O resets, repeated
@@ -865,10 +965,13 @@ optional primary/standby helper covers actual recovery cancellations and
 restartpoints. Archiver tests cover cached and unrelated resets, repeated calls,
 end-event state (including stale/NULL values), bigint precision and both individual
 counter decreases. A private archive-mode cluster checks actual copies, failed
-commands and reset followed by success. Installation tests
+commands and reset followed by success. Statement-specific tests additionally
+cover calls/plans/rows/WAL, nested queries, user/database/top-level keys, hidden
+query IDs, selective/full/minmax-only resets, eviction and reentry, tracking off,
+empty snapshots, exact numeric bytes, moved/quoted schemas and rejected versions. Installation tests
 verify that
 only 0.1.0 is available, both default and explicit version selection install all
-thirteen extension members, and extension removal cleans up those functions. These
+fourteen extension members, and extension removal cleans up those functions. These
 checks include another schema and empty user-table/index sets in a separate
 disposable database. Sampling tests wait until the measurement connection enters
 `pg_sleep` before generating activity.

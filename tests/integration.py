@@ -1858,13 +1858,26 @@ class InvalidDeltaArithmeticTests(unittest.TestCase):
                         self.assertIsNone(value, name)
 
 
+class OptionalStatementsTests(unittest.TestCase):
+    def test_missing_dependency_and_validation(self):
+        sql('CREATE EXTENSION IF NOT EXISTS pg_stat_delta')
+        if sql("SELECT count(*) FROM pg_extension WHERE extname='pg_stat_statements'") != '0':
+            self.skipTest('This check requires a database without the optional dependency')
+        for argument, message in [('0','pg_stat_statements is not installed'),
+                                  ('NULL','finite nonnegative'), ('-1','finite nonnegative')]:
+            result = subprocess.run([PSQL,'-X','-v','ON_ERROR_STOP=1','-c',
+                f'SELECT * FROM pg_stat_statements_delta({argument})'],capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn(message,result.stderr)
+
+
 class InstallationTests(unittest.TestCase):
     def test_single_version_install(self):
         name = 'delta_test_installation'
         functions = ['pg_stat_database_delta', 'pg_stat_user_tables_delta',
                      'pg_stat_user_indexes_delta', 'pg_statio_user_tables_delta',
                      'pg_statio_user_indexes_delta', 'pg_stat_wal_delta', 'pg_stat_io_delta', 'pg_stat_user_functions_delta', 'pg_stat_bgwriter_delta',
-                     'pg_stat_checkpointer_delta', 'pg_stat_slru_delta', 'pg_stat_database_conflicts_delta', 'pg_stat_archiver_delta']
+                     'pg_stat_checkpointer_delta', 'pg_stat_slru_delta', 'pg_stat_database_conflicts_delta', 'pg_stat_archiver_delta', 'pg_stat_statements_delta']
         sql(f'CREATE DATABASE {name}')
         try:
             self.assertEqual(sql("SELECT version FROM pg_available_extension_versions "
@@ -1877,6 +1890,13 @@ class InstallationTests(unittest.TestCase):
                 self.assertEqual(sql("SELECT extversion FROM pg_extension WHERE extname='pg_stat_delta'",
                                      PGDATABASE=name), '0.1.0')
                 for function in functions:
+                    if function == 'pg_stat_statements_delta':
+                        result = subprocess.run([PSQL, '-X', '-v', 'ON_ERROR_STOP=1', '-c',
+                            f'SELECT * FROM {schema}.{function}(0)'], env={**os.environ,'PGDATABASE':name},
+                            capture_output=True,text=True)
+                        self.assertNotEqual(result.returncode,0)
+                        self.assertIn('pg_stat_statements is not installed',result.stderr)
+                        continue
                     rows = sql(f'SELECT count(*) FROM {schema}.{function}(0)', PGDATABASE=name)
                     if function in ['pg_stat_database_delta', 'pg_stat_wal_delta', 'pg_stat_io_delta',
                                     'pg_stat_bgwriter_delta', 'pg_stat_checkpointer_delta', 'pg_stat_slru_delta',
@@ -1884,14 +1904,14 @@ class InstallationTests(unittest.TestCase):
                         self.assertGreater(int(rows), 0)
                     else:
                         self.assertEqual(rows, '0')
-                # All thirteen functions must be extension members, not loose SQL objects.
+                # All fourteen functions must be extension members, not loose SQL objects.
                 self.assertEqual(sql("SELECT count(*) FROM pg_depend d "
                                      "JOIN pg_extension e ON e.oid=d.refobjid "
                                      "JOIN pg_proc p ON p.oid=d.objid "
                                      "WHERE e.extname='pg_stat_delta' AND d.deptype='e' "
                                      "AND d.classid='pg_proc'::regclass "
                                      "AND d.refclassid='pg_extension'::regclass",
-                                     PGDATABASE=name), '13')
+                                     PGDATABASE=name), '14')
                 start = time.monotonic()
                 sql(f'SELECT count(*) FROM {schema}.pg_statio_user_indexes_delta(0.1)', PGDATABASE=name)
                 self.assertGreaterEqual(time.monotonic() - start, .1)

@@ -8,7 +8,9 @@ plans at different tracked-row counts are in [function query](function-query.md)
 The singleton background-writer sampler is described in [bgwriter query](bgwriter-query.md).
 The new analyses cover [checkpointer](checkpointer-query.md), [SLRU](slru-query.md)
 and [database conflicts](conflicts-query.md). The singleton archiver with final
-event state is described in [archiver query](archiver-query.md). The comparisons below evaluate complete implementations, including compact
+event state is described in [archiver query](archiver-query.md). The optional
+statement sampler compares three classifier implementations and records spills
+in [statement query](statements-query.md). The comparisons below evaluate complete implementations, including compact
 result changes and correctness fixes, not isolated join algorithms.
 
 Current query ordering and guarded-subtraction changes are described in
@@ -44,6 +46,7 @@ Use a representative disposable database and standard PGHOST, PGPORT, PGDATABASE
 and PGUSER settings, optionally PSQL to select a client:
 
 ```sh
+python3 tests/explain_statistics.py --view statements
 python3 tests/explain_statistics.py --view archiver
 python3 tests/explain_statistics.py --view checkpointer
 python3 tests/explain_statistics.py --view slru

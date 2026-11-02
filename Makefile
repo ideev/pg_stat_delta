@@ -12,7 +12,8 @@ FUNCTION_SQL = sql/pg_stat_database_delta.sql \
                sql/pg_stat_checkpointer_delta.sql \
                sql/pg_stat_slru_delta.sql \
                sql/pg_stat_database_conflicts_delta.sql \
-               sql/pg_stat_archiver_delta.sql
+               sql/pg_stat_archiver_delta.sql \
+               sql/pg_stat_statements_delta.sql
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)

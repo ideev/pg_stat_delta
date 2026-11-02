@@ -36,7 +36,7 @@ view can be reduced to a catalog-only plan and does not establish cached stats.
 
 ## Statistics query baselines
 
-All thirteen samplers use the same pre-scan cache-clear dependency in both
+All fourteen samplers use the same pre-scan cache-clear dependency in both
 first_snapshot and second_snapshot:
 
 ```sql
@@ -108,6 +108,20 @@ not discard final event state. End timestamps can predate sampling, and failure
 counts can include retries for one filename. Never enable archiving, switch WAL
 or invoke archive commands from the sampler; real archive tests use only the
 private-cluster helper. See docs/archiver-query.md.
+
+The statement sampler is an optional pg_stat_statements 1.11 dependency; do not
+make the whole extension require it or alter the monitored server's preload or
+tracking settings. Resolve/quote its extension namespace and bind the interval;
+keep SECURITY INVOKER and fixed search_path. Pair userid/dbid/toplevel/queryid,
+omit hidden NULL query IDs, preserve numeric WAL bytes and use per-entry
+stats_since (not database/global/minmax markers). Missing/reset/decreased rows
+invalidate all 34 additive deltas. Fetch text only on the second read through
+the source getter's showtext argument; no extrema/mean/stddev differences.
+Its expensive 34-metric classifier is deliberately materialized: measurements
+beat repeated evaluation or extra joins, but 5,000 entries spilled at default
+work_mem. Preserve/report that CPU/memory/I/O tradeoff and benchmark substantive
+changes. Dedicated tests use only a private preloaded cluster. See
+docs/statements-query.md.
 
 See docs/uniform-snapshots.md for the current query policy and measurements.
 The per-function query documents retain earlier implementation comparisons.
